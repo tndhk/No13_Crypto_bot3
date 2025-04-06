@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  enhanced-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enhanced-trading-bot:latest
+    container_name: enhanced-trading-bot
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./results:/app/results
+      - ./cache:/app/cache
+    env_file:
+      - .env
+    command: --start ${START_TIME} --end ${END_TIME} --symbol ${SYMBOL} --interval ${INTERVAL} --output results
