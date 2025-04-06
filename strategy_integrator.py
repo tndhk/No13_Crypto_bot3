@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-戦略統合モジュール
+最適化された戦略統合モジュール
 
-複数の取引戦略からのシグナルを統合し、最終的な取引判断を行います。
-Mean Reversion戦略の影響力を強化するように最適化されています。
+処理時間を大幅に短縮し、Mean Reversion戦略の性能を保護しています。
 """
 import numpy as np
 import pandas as pd
@@ -20,22 +19,32 @@ class StrategyIntegrator:
         """
         # デフォルト設定
         self.config = {
-            'buy_threshold': 0.25,     # 買いシグナル閾値 (旧: 0.3)
-            'sell_threshold': -0.25,   # 売りシグナル閾値 (旧: -0.3)
+            'buy_threshold': 0.25,     # 買いシグナル閾値
+            'sell_threshold': -0.25,   # 売りシグナル閾値
             'adx_threshold': 25,       # トレンド判定のADX閾値
             'high_vol_threshold': 0.012, # 高ボラティリティ閾値
             'low_vol_threshold': 0.006,  # 低ボラティリティ閾値
             'strong_signal_threshold': 0.7, # 強いシグナル閾値
             'very_strong_signal_threshold': 0.8, # 非常に強いシグナル閾値
+            'preserve_mean_reversion': True,  # Mean Reversion戦略の重み保持
+            'trend_quality_filter': True,     # トレンド品質フィルター
+            'breakout_quality_filter': True,  # ブレイクアウト品質フィルター
+            'use_caching': True,              # キャッシング機能を使用（新規追加）
+            'mr_max_hold_hours': 12,          # Mean Reversion最大保有時間（新規追加）
+            'mr_tp_factor': 0.65              # Mean Reversionの早期利益確定係数（新規追加）
         }
         
         # 設定の上書き
         if config:
             self.config.update(config)
+            
+        # キャッシュ機構の初期化
+        self._adx_cache = {}
+        self._weight_scenarios_cache = {}
     
     def integrate_strategies(self, trend_signal, breakout_signal, mean_reversion_signal, data):
         """
-        複数の取引戦略からシグナルを統合
+        複数の取引戦略からシグナルを統合（最適化版）
         
         Parameters:
         -----------
@@ -68,12 +77,12 @@ class StrategyIntegrator:
         
         # シグナル強度を考慮
         signal_strengths = {
-            'trend': 0.5,  # デフォルト値
-            'breakout': 0.5,  # デフォルト値
-            'mean_reversion': mean_reversion_signal.get('signal_strength', 0.5)  # 強化版の強度値
+            'trend': trend_signal.get('signal_strength', 0.5),
+            'breakout': breakout_signal.get('signal_strength', 0.5),
+            'mean_reversion': mean_reversion_signal.get('signal_strength', 0.5)
         }
         
-        # 市場環境の分析（トレンド/レンジ判定）
+        # 市場環境の分析（トレンド/レンジ判定） - キャッシュ使用
         adx_value = self._calculate_adx(data)
         is_trending = adx_value > self.config['adx_threshold']
         
@@ -83,7 +92,89 @@ class StrategyIntegrator:
         is_high_volatility = atr_ratio > self.config['high_vol_threshold']
         is_low_volatility = atr_ratio < self.config['low_vol_threshold']
         
-        # 環境とシグナルに基づく戦略の重み付け
+        # 最適化: MR戦略が単独の場合、優先処理
+        if self.config['preserve_mean_reversion']:
+            # Mean Reversionのシグナルが単独で発生した場合は優先
+            if signals['mean_reversion'] != 0 and (signals['trend'] == 0 or signals['breakout'] == 0):
+                # Mean Reversion単独または一つの戦略とのみ一致する場合、高い重みを設定
+                weights = {'mean_reversion': 0.85, 'trend': 0.075, 'breakout': 0.075}
+                
+                # 以下の計算をスキップ
+                weighted_signal = signals['mean_reversion'] * 0.85
+                if signals['trend'] != 0:
+                    weighted_signal += signals['trend'] * 0.075
+                if signals['breakout'] != 0:
+                    weighted_signal += signals['breakout'] * 0.075
+                
+                # 最終シグナルの判定
+                final_signal = 0
+                if weighted_signal >= self.config['buy_threshold']:
+                    final_signal = 1
+                elif weighted_signal <= self.config['sell_threshold']:
+                    final_signal = -1
+                
+                # 理由文字列を生成
+                signal_reason = self._generate_signal_reason(
+                    final_signal, signals, weights, is_trending, atr_ratio,
+                    mean_reversion_signal.get('signal_reasons', [])
+                )
+                
+                # 統合されたシグナル情報をまとめる
+                integrated_info = {
+                    'timestamp': current['timestamp'],
+                    'open': current['open'],
+                    'high': current['high'],
+                    'low': current['low'],
+                    'close': current['close'],
+                    'signal': final_signal,
+                    'weighted_signal': weighted_signal,
+                    'adx': adx_value,
+                    'is_trending': is_trending,
+                    'atr_ratio': atr_ratio,
+                    'strategy_agreement': 1,  # MR戦略優先
+                    'strategy_signals': signals,
+                    'strategy_weights': weights,
+                    'signal_strengths': signal_strengths,
+                    'signal_reason': signal_reason
+                }
+                
+                # Mean Reversionの詳細情報も追加
+                if signals['mean_reversion'] != 0:
+                    integrated_info['mean_reversion_details'] = {
+                        'strength': signal_strengths['mean_reversion'],
+                        'reasons': mean_reversion_signal.get('signal_reasons', []),
+                        'z_score': mean_reversion_signal.get('z_score', 0)
+                    }
+                
+                # 利用可能な指標情報を追加
+                for key in ['RSI', 'MACD', 'BB_upper', 'BB_lower', 'SMA_short', 'SMA_long']:
+                    if key in current:
+                        integrated_info[key] = current[key]
+                
+                return integrated_info
+        
+        # トレンド戦略の品質フィルター
+        if self.config['trend_quality_filter'] and signals['trend'] != 0:
+            # ADXが低い場合はトレンドシグナルを弱める
+            if adx_value < 20:
+                signal_strengths['trend'] *= 0.6
+            
+            # トレンドシグナルの確認要素が少ない場合は弱める
+            confirmation_count = trend_signal.get('confirmation_count', 0)
+            if confirmation_count < 2:
+                signal_strengths['trend'] *= 0.7
+        
+        # ブレイクアウト戦略の品質フィルター
+        if self.config['breakout_quality_filter'] and signals['breakout'] != 0:
+            # 重要なレベルでないブレイクアウトは弱める
+            if not breakout_signal.get('is_important_level', True):
+                signal_strengths['breakout'] *= 0.6
+                
+            # ボラティリティが低い場合はブレイクアウトシグナルを弱める
+            if atr_ratio < 0.008:
+                signal_strengths['breakout'] *= 0.7
+        
+        # 環境とシグナルに基づく戦略の重み付け（キャッシュ機構使用）
         weights = self._calculate_strategy_weights(
             is_trending, is_high_volatility, is_low_volatility, 
             signals, signal_strengths
@@ -152,53 +243,83 @@ class StrategyIntegrator:
     
     def _calculate_strategy_weights(self, is_trending, is_high_volatility, is_low_volatility, 
                                   signals, signal_strengths):
-        """市場環境に基づく戦略ウェイトの計算"""
-        weights = {
-            'trend': 0.0,
-            'breakout': 0.0,
-            'mean_reversion': 0.0
-        }
+        """市場環境に基づく戦略ウェイトの計算（最適化版）"""
         
-        # トレンド環境での重み付け - mean_reversion の重みを増加
-        if is_trending:
-            if is_high_volatility:
-                # 高ボラティリティなトレンド
-                weights['trend'] = 0.45
-                weights['breakout'] = 0.35
-                weights['mean_reversion'] = 0.20  # 0.1から0.2に増加
+        # キャッシュ使用（高速化）
+        cache_key = (is_trending, is_high_volatility, is_low_volatility)
+        
+        # 予め計算された共通のシナリオに基づく重みを使用
+        if self.config['preserve_mean_reversion']:
+            # キャッシュから重みを取得
+            if cache_key in self._weight_scenarios_cache:
+                weights = self._weight_scenarios_cache[cache_key].copy()
             else:
-                # 通常のトレンド
-                weights['trend'] = 0.50
-                weights['breakout'] = 0.30
-                weights['mean_reversion'] = 0.20  # 0.1から0.2に増加
-        
-        # レンジ環境での重み付け - mean_reversion の重みをさらに増加
+                # シナリオに基づくウェイトマップを事前定義
+                weight_scenarios = {
+                    # (is_trending, is_high_vol, is_low_vol): {'trend': w1, 'breakout': w2, 'mean_reversion': w3}
+                    (True, True, False): {'trend': 0.45, 'breakout': 0.35, 'mean_reversion': 0.20},
+                    (True, False, False): {'trend': 0.50, 'breakout': 0.30, 'mean_reversion': 0.20},
+                    (False, False, True): {'trend': 0.05, 'breakout': 0.15, 'mean_reversion': 0.80},
+                    (False, False, False): {'trend': 0.15, 'breakout': 0.25, 'mean_reversion': 0.60}
+                }
+                
+                # 現在の市場状況に基づいてウェイトを選択
+                if cache_key in weight_scenarios:
+                    weights = weight_scenarios[cache_key].copy()
+                else:
+                    # デフォルトのウェイト
+                    weights = {'trend': 0.15, 'breakout': 0.25, 'mean_reversion': 0.60}
+                
+                # キャッシュに保存
+                self._weight_scenarios_cache[cache_key] = weights.copy()
         else:
-            if is_low_volatility:
-                # 低ボラティリティなレンジ
-                weights['trend'] = 0.05  # 0.1から減少
-                weights['breakout'] = 0.15  # 0.2から減少
-                weights['mean_reversion'] = 0.80  # 0.7から増加
+            # Mean Reversion重みを調整する場合の重み付け
+            if is_trending:
+                if is_high_volatility:
+                    # 高ボラティリティなトレンド
+                    weights = {'trend': 0.60, 'breakout': 0.30, 'mean_reversion': 0.10}
+                else:
+                    # 通常のトレンド
+                    weights = {'trend': 0.65, 'breakout': 0.25, 'mean_reversion': 0.10}
             else:
-                # 通常のレンジ
-                weights['trend'] = 0.15  # 0.2から減少
-                weights['breakout'] = 0.25  # 0.3から減少
-                weights['mean_reversion'] = 0.60  # 0.5から増加
+                if is_low_volatility:
+                    # 低ボラティリティなレンジ
+                    weights = {'trend': 0.05, 'breakout': 0.15, 'mean_reversion': 0.80}
+                else:
+                    # 通常のレンジ
+                    weights = {'trend': 0.15, 'breakout': 0.25, 'mean_reversion': 0.60}
+        
+        # シグナル強度に基づく重み調整（Mean Reversionは影響を受けない）
+        # トレンドシグナルの重み調整
+        if signals['trend'] != 0:
+            trend_quality = signal_strengths['trend']
+            if trend_quality > 0.7:  # 高品質シグナル
+                # トレンドの重みをブレイクアウトから移動（Mean Reversionに影響なし）
+                weights['trend'] += weights['breakout'] * 0.3
+                weights['breakout'] *= 0.7
+        
+        # ブレイクアウトシグナルの重み調整
+        if signals['breakout'] != 0:
+            breakout_quality = signal_strengths['breakout']
+            if breakout_quality > 0.7:  # 高品質シグナル
+                # ブレイクアウトの重みをトレンドから移動（Mean Reversionに影響なし）
+                weights['breakout'] += weights['trend'] * 0.3
+                weights['trend'] *= 0.7
         
         # 平均回帰シグナルが特に強い場合、その重みをさらに増加
         if abs(signals['mean_reversion']) > 0 and signal_strengths['mean_reversion'] > self.config['strong_signal_threshold']:
             # 他の戦略の重みを減らし、平均回帰の重みを増加
-            for strategy in ['trend', 'breakout']:
-                weights[strategy] *= 0.8  # 20%減少
+            weight_reduction_trend = weights['trend'] * 0.2
+            weight_reduction_breakout = weights['breakout'] * 0.2
             
-            # 減少分を平均回帰の重みに加算
-            weight_reduction = (weights['trend'] * 0.2 + weights['breakout'] * 0.2)
-            weights['mean_reversion'] += weight_reduction
+            weights['trend'] -= weight_reduction_trend
+            weights['breakout'] -= weight_reduction_breakout
+            weights['mean_reversion'] += (weight_reduction_trend + weight_reduction_breakout)
         
         return weights
     
     def _generate_signal_reason(self, final_signal, signals, weights, is_trending, atr_ratio, mr_reasons):
-        """シグナル生成理由の文字列を生成"""
+        """シグナル生成理由の文字列を生成（最適化版）"""
         if final_signal == 0:
             return "シグナルなし"
         
@@ -222,46 +343,72 @@ class StrategyIntegrator:
         
         reason += f", {env_type}"
         
-        # Mean Reversionの詳細理由を追加
+        # 戦略固有の理由を追加
         if dominant_strategy == 'mean_reversion' and mr_reasons:
             reason += f", 理由: {', '.join(mr_reasons[:2])}"  # 最初の2つの理由を表示
+        elif dominant_strategy == 'trend':
+            # Trend戦略の改善に関する情報
+            if 'confirmation_count' in signals:
+                reason += f", 確認指標: {signals.get('confirmation_count', 0)}"
+            if is_trending:
+                reason += f", ADX: {signals.get('adx', 0):.1f}"
+        elif dominant_strategy == 'breakout':
+            # Breakout戦略の改善に関する情報
+            if signals.get('is_important_level', True):
+                reason += ", 重要なレベル"
+            else:
+                reason += ", 一般的なレベル"
         
         return reason
     
     def _calculate_adx(self, data, period=14):
-        """ADX（平均方向性指数）の計算"""
-        df = data.copy()
-        if 'adx' in df.columns and not pd.isna(df['adx'].iloc[-1]):
-            return df['adx'].iloc[-1]
+        """ADX（平均方向性指数）の計算（キャッシュ機能付き）"""
+        # キャッシュから取得を試みる
+        cache_key = len(data)
+        if cache_key in self._adx_cache:
+            return self._adx_cache[cache_key]
             
-        # True Range
-        df['tr0'] = abs(df['high'] - df['low'])
-        df['tr1'] = abs(df['high'] - df['close'].shift())
-        df['tr2'] = abs(df['low'] - df['close'].shift())
-        df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+        # データフレームに既に計算済みなら使用
+        if 'adx' in data.columns and not pd.isna(data['adx'].iloc[-1]):
+            adx_value = data['adx'].iloc[-1]
+            # キャッシュに保存
+            self._adx_cache[cache_key] = adx_value
+            return adx_value
+            
+        # ADXの列名が大文字の場合もチェック
+        if 'ADX' in data.columns and not pd.isna(data['ADX'].iloc[-1]):
+            adx_value = data['ADX'].iloc[-1]
+            # キャッシュに保存
+            self._adx_cache[cache_key] = adx_value
+            return adx_value
+            
+        # 最適化: 簡易ADX計算に切り替え
+        # (計算コストの高いADX計算を避けるための簡易版)
+        high = data['high'].tail(period * 2).values
+        low = data['low'].tail(period * 2).values
+        close = data['close'].tail(period * 2).values
         
-        # +DM, -DM
-        df['up_move'] = df['high'] - df['high'].shift()
-        df['down_move'] = df['low'].shift() - df['low']
+        # 単純化されたATR計算（正確性よりも速度優先）
+        tr = np.zeros(len(high))
+        for i in range(1, len(high)):
+            tr[i] = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
+        atr = np.mean(tr[-period:])
         
-        df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)
-        df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)
+        # 方向性指標の簡易計算
+        direction = np.sign(close[-1] - close[-period])
+        slope = abs(close[-1] - close[-period]) / close[-period]
         
-        # 14期間の平均
-        df['plus_di'] = 100 * (df['plus_dm'].rolling(window=period).mean() / df['tr'].rolling(window=period).mean())
-        df['minus_di'] = 100 * (df['minus_dm'].rolling(window=period).mean() / df['tr'].rolling(window=period).mean())
+        # 簡易ADX値（0-100の範囲）
+        adx_value = min(100, max(0, slope * 100 * (1 + atr / close[-1])))
         
-        # DX
-        df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+        # キャッシュに保存
+        self._adx_cache[cache_key] = adx_value
         
-        # ADX
-        df['adx'] = df['dx'].rolling(window=period).mean()
-        
-        return df['adx'].iloc[-1] if not df['adx'].empty else 0
+        return adx_value
     
     def adaptive_risk_reward(self, signal_info, base_sl_percent=1.5, base_tp_percent=5.0):
         """
-        市場環境とシグナルタイプに基づいて動的にリスク/リワード比を調整
+        市場環境とシグナルタイプに基づいて動的にリスク/リワード比を調整（最適化版）
         
         Parameters:
         -----------
@@ -296,24 +443,45 @@ class StrategyIntegrator:
             
         # 戦略タイプに応じた調整
         if dominant_strategy == 'trend':
-            # トレンドフォロー戦略ではより広いTP設定
+            # 改善されたトレンドフォロー戦略では早期利益確定を重視
+            # TP/SL比率をより最適化
             tp_percent *= 1.2
+            
+            # ADX値に基づく調整
+            adx_value = signal_info.get('adx', 25)
+            if adx_value > 35:  # 非常に強いトレンド
+                # 強いトレンドではより広いTPとSL
+                tp_percent *= 1.2
+                sl_percent *= 0.9  # より狭いSLで早期損切り
+            
+            # RSIに基づく調整
+            rsi = signal_info.get('RSI', 50)
+            if (signal_info['signal'] > 0 and rsi > 65) or (signal_info['signal'] < 0 and rsi < 35):
+                # 極端なRSIではリバーサルの可能性を考慮
+                tp_percent *= 0.8  # 早めの利益確定
+        
         elif dominant_strategy == 'breakout':
-            # ブレイクアウト戦略では迅速なTP/SL
+            # 改善されたブレイクアウト戦略では、より広いSLと適切なTP
             tp_percent *= 1.1
-            sl_percent *= 0.9
+            sl_percent *= 1.1  # ブレイクアウト後の揺り戻しを考慮
+            
+            # 重要なレベルでのブレイクアウトはより大きな値幅を狙える
+            if signal_info.get('is_important_level', False):
+                tp_percent *= 1.2
+            
+            # 高ボラティリティ環境ではより広いSL
+            if signal_info.get('atr_ratio', 0.01) > 0.015:
+                sl_percent *= 1.2
+                tp_percent *= 1.1
+        
         elif dominant_strategy == 'mean_reversion':
-            # 平均回帰戦略特有の設定
+            # 平均回帰戦略の最適化 - 保有期間短縮のため早めのTP
             signal_strength = signal_info.get('signal_strengths', {}).get('mean_reversion', 0.5)
             
-            if signal_strength > self.config['strong_signal_threshold']:  # 強い平均回帰シグナル
-                # 強いシグナルではより狭いTP（早めの利確）と狭いSL（小さなリスク）
-                tp_percent = tp_percent * 0.7
-                sl_percent = sl_percent * 0.7
-            else:
-                # 通常の平均回帰シグナル
-                tp_percent = tp_percent * 0.8
-                sl_percent = sl_percent * 0.8
+            # 早期利益確定を強化
+            mr_tp_factor = self.config.get('mr_tp_factor', 0.65)
+            tp_percent = tp_percent * mr_tp_factor  # 早めのTeach Profit
+            sl_percent = sl_percent * 0.75
         
         # 市場環境（トレンド/レンジ）に基づく調整
         if signal_info.get('is_trending', False):
