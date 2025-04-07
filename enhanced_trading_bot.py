@@ -166,11 +166,11 @@ class EnhancedTradingBot:
         }
         
         # トレンド戦略の設定
-        trend_config = {
-            'short_window': self.short_window,
-            'long_window': self.long_window,
-            'adx_threshold': 25,
-        }
+        # trend_config = {
+        #     'short_window': self.short_window,
+        #     'long_window': self.long_window,
+        #     'adx_threshold': 25,
+        # }
         
         # ブレイクアウト戦略の設定
         breakout_config = {
@@ -188,7 +188,7 @@ class EnhancedTradingBot:
         # 戦略オブジェクトの作成
         try:
             self.mean_reversion_strategy = MeanReversionStrategy(mr_config)
-            self.trend_strategy = TrendStrategy(trend_config)
+            # self.trend_strategy = TrendStrategy(trend_config)
             self.breakout_strategy = BreakoutStrategy(breakout_config)
             self.strategy_integrator = StrategyIntegrator(integrator_config)
         except NameError as e:
@@ -609,14 +609,14 @@ class EnhancedTradingBot:
                 prev_data = df.iloc[:i+1]
                 current_data = df.iloc[i]
                 
-                # 各戦略からのシグナルを取得
-                trend_signal = self.trend_strategy.generate_signals(prev_data)
-                breakout_signal = self.breakout_strategy.generate_signals(prev_data)
+                # 各戦略のシグナルを計算
+                # trend_signal = self.trend_strategy.generate_signals(prev_data)
+                breakout_signal = {} # 常に空のシグナル
                 mean_reversion_signal = self.mean_reversion_strategy.generate_signals(prev_data)
                 
                 # 戦略の統合
                 signal_info = self.strategy_integrator.integrate_strategies(
-                    trend_signal, breakout_signal, mean_reversion_signal, prev_data
+                    {}, breakout_signal, mean_reversion_signal, prev_data
                 )
                 
                 current_price = current_data['close']

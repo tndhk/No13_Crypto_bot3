@@ -59,7 +59,7 @@ class TrendStrategy:
         
         # 基本シグナル
         signal = 0
-        signal_strength = 0
+        signal_strength = 0 # 単純化のため、強度は 1 or 0 とする
         signal_reasons = []
         
         # 1. 移動平均クロスオーバー検出
@@ -68,136 +68,26 @@ class TrendStrategy:
             if (previous['EMA_short'] <= previous['EMA_long'] and 
                 current['EMA_short'] > current['EMA_long']):
                 signal = 1
-                # クロスオーバーの強さを計算（乖離率）
-                crossover_strength = (current['EMA_short'] / current['EMA_long'] - 1) * 100
-                signal_strength += min(crossover_strength * 5, 0.5)  # 最大0.5
-                signal_reasons.append(f"EMAクロス(上抜け:{crossover_strength:.2f}%)")
+                signal_reasons.append(f"EMAクロス(上抜け)")
             
             # 短期MAが長期MAを下抜け（売り）
             elif (previous['EMA_short'] >= previous['EMA_long'] and 
                   current['EMA_short'] < current['EMA_long']):
                 signal = -1
-                # クロスオーバーの強さを計算
-                crossover_strength = (1 - current['EMA_short'] / current['EMA_long']) * 100
-                signal_strength += min(crossover_strength * 5, 0.5)  # 最大0.5
-                signal_reasons.append(f"EMAクロス(下抜け:{crossover_strength:.2f}%)")
-        
-        # 2. MACD シグナルクロス
-        if 'MACD' in current and 'MACD_signal' in current and signal == 0:
-            # MACDがシグナルラインを上抜け（買い）
-            if (previous['MACD'] <= previous['MACD_signal'] and 
-                current['MACD'] > current['MACD_signal']):
-                signal = 1
-                # クロスの強さを計算
-                macd_strength = abs(current['MACD'] - current['MACD_signal']) / abs(current['MACD_signal']) if current['MACD_signal'] != 0 else 0
-                signal_strength += min(macd_strength * 10, 0.6)  # 最大0.6
-                signal_reasons.append(f"MACDクロス(上向き)")
-                
-                # ヒストグラムが加速しているかチェック
-                if 'MACD_hist' in current and 'MACD_hist_prev' in current:
-                    if current['MACD_hist'] > current['MACD_hist_prev']:
-                        signal_strength += 0.1
-                        signal_reasons[-1] += "(加速)"
+                signal_reasons.append(f"EMAクロス(下抜け)")
+
+        # 2. ADXによるトレンド強度の確認 (フィルターとしてのみ使用)
+        if signal != 0: # クロスオーバーが発生した場合のみADXをチェック
+            adx_value = current.get('ADX', self._calculate_adx(data))
             
-            # MACDがシグナルラインを下抜け（売り）
-            elif (previous['MACD'] >= previous['MACD_signal'] and 
-                  current['MACD'] < current['MACD_signal']):
-                signal = -1
-                # クロスの強さを計算
-                macd_strength = abs(current['MACD'] - current['MACD_signal']) / abs(current['MACD_signal']) if current['MACD_signal'] != 0 else 0
-                signal_strength += min(macd_strength * 10, 0.6)  # 最大0.6
-                signal_reasons.append(f"MACDクロス(下向き)")
-                
-                # ヒストグラムが加速しているかチェック
-                if 'MACD_hist' in current and 'MACD_hist_prev' in current:
-                    if current['MACD_hist'] < current['MACD_hist_prev']:
-                        signal_strength += 0.1
-                        signal_reasons[-1] += "(加速)"
-        
-        # 3. RSIによる過剰売買の検出と修正（トレンド継続の確認/フィルタリング）
-        if 'RSI' in current and signal != 0:
-            # 買いシグナルだがRSIが過買い状態
-            if signal > 0 and current['RSI'] > self.config['rsi_overbought']:
-                # 過買い状態なのでシグナルを弱める
-                signal_strength *= 0.7
-                signal_reasons.append(f"RSI過買い警告({current['RSI']:.1f})")
-            
-            # 売りシグナルだがRSIが過売り状態
-            elif signal < 0 and current['RSI'] < self.config['rsi_oversold']:
-                # 過売り状態なのでシグナルを弱める
-                signal_strength *= 0.7
-                signal_reasons.append(f"RSI過売り警告({current['RSI']:.1f})")
-            
-            # トレンド方向と一致するRSI
-            elif (signal > 0 and current['RSI'] > 50) or (signal < 0 and current['RSI'] < 50):
-                # トレンドとRSIが一致するのでシグナルを強化
-                signal_strength += 0.1
-                signal_reasons.append(f"RSIトレンド一致({current['RSI']:.1f})")
-        
-        # 4. ADXによるトレンド強度の確認
-        adx_value = current.get('ADX', self._calculate_adx(data))
-        
-        # ADXが強いトレンドを示す場合、シグナル強度を加算
-        if adx_value > self.config['adx_strong_threshold']:  # 非常に強いトレンド
-            signal_strength += 0.2
-            signal_reasons.append(f"ADX強トレンド({adx_value:.1f})")
-        elif adx_value > self.config['adx_threshold']:  # 強いトレンド
-            signal_strength += 0.1
-            signal_reasons.append(f"ADXトレンド({adx_value:.1f})")
-        elif adx_value < 20 and signal != 0:  # 弱いトレンド - シグナルを弱める
-            signal_strength *= 0.8
-            signal_reasons.append(f"ADX弱({adx_value:.1f})")
-        
-        # 5. 価格とMAの位置関係による確認
-        if 'SMA_short' in current and 'SMA_long' in current and signal != 0:
-            price_vs_ma = 0
-            
-            # 買いシグナルの場合、価格が両方のMAより上にあればトレンド強化
-            if signal > 0:
-                if current['close'] > max(current['SMA_short'], current['SMA_long']):
-                    price_vs_ma = 1
-                    signal_reasons.append("価格>両MA")
-                elif current['close'] < min(current['SMA_short'], current['SMA_long']):
-                    price_vs_ma = -1
-                    signal_reasons.append("価格<両MA")
-            
-            # 売りシグナルの場合、価格が両方のMAより下にあればトレンド強化
-            elif signal < 0:
-                if current['close'] < min(current['SMA_short'], current['SMA_long']):
-                    price_vs_ma = 1
-                    signal_reasons.append("価格<両MA")
-                elif current['close'] > max(current['SMA_short'], current['SMA_long']):
-                    price_vs_ma = -1
-                    signal_reasons.append("価格>両MA")
-            
-            # シグナル強度を調整
-            if price_vs_ma == 1:  # トレンドを強化
-                signal_strength += 0.1
-            elif price_vs_ma == -1:  # トレンドに反するので強度を下げる
-                signal_strength *= 0.8
-        
-        # 6. ボラティリティフィルター
-        if 'ATR' in current:
-            atr_ratio = current['ATR'] / current['close']
-            
-            # 極端に低いボラティリティはトレンドの信頼性を下げる
-            if atr_ratio < 0.005 and signal != 0:
-                signal_strength *= 0.7
-                signal_reasons.append(f"低ボラティリティ({atr_ratio*100:.2f}%)")
-            
-            # 高ボラティリティは良いが、過度な場合は注意
-            elif atr_ratio > 0.02 and signal != 0:
-                signal_strength *= 0.8
-                signal_reasons.append(f"過度なボラティリティ({atr_ratio*100:.2f}%)")
-            elif atr_ratio > 0.01 and signal != 0:
-                signal_strength += 0.1
-                signal_reasons.append(f"適正ボラティリティ({atr_ratio*100:.2f}%)")
-        
-        # 最終的なシグナル強度が閾値を超えない場合、シグナルを無効化
-        if signal_strength < 0.4 and signal != 0:
-            old_signal = signal
-            signal = 0
-            signal_reasons.append(f"シグナル強度不足({signal_strength:.2f})")
+            # ADXが閾値未満ならシグナルを無効化
+            if adx_value < self.config['adx_threshold']:
+                signal = 0 # トレンドがないのでシグナルをキャンセル
+                signal_reasons.append(f"ADX閾値未満({adx_value:.1f} < {self.config['adx_threshold']}) - シグナル取消")
+            else:
+                # トレンドありと判断、シグナル強度をセット
+                signal_strength = 1.0 
+                signal_reasons.append(f"ADXトレンド確認({adx_value:.1f} >= {self.config['adx_threshold']})")
         
         # シグナル情報をまとめる
         signal_info = {
@@ -207,13 +97,13 @@ class TrendStrategy:
             'low': current['low'],
             'close': current['close'],
             'signal': signal,
-            'adx': adx_value,
-            'signal_strength': signal_strength,
+            'adx': current.get('ADX', np.nan), # adx_value を使うか、元の値を使うか注意
+            'signal_strength': signal_strength, # 1.0 or 0.0
             'signal_reasons': signal_reasons
         }
         
-        # 既存の指標情報も追加
-        for key in ['RSI', 'MACD', 'SMA_short', 'SMA_long', 'ATR']:
+        # 既存の指標情報も追加 (必要最低限)
+        for key in ['EMA_short', 'EMA_long', 'ADX']: # RSI, MACD, SMA, ATR は不要に
             if key in current:
                 signal_info[key] = current[key]
         
