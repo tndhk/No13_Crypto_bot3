@@ -650,9 +650,11 @@ class EnhancedTradingBot:
                         slippage = self.calculate_slippage(is_buy=False)
                         execution_price = exit_price * (1 + slippage)
                         
-                        # 手数料を考慮した利益計算
+                        # 手数料を考慮した利益計算 (maker + taker)
                         gross_profit = (execution_price - self.entry_price) * self.trade_quantity
-                        fees = gross_profit * self.taker_fee
+                        entry_fee = self.entry_price * self.trade_quantity * self.maker_fee
+                        exit_fee = execution_price * self.trade_quantity * self.taker_fee
+                        fees = entry_fee + exit_fee
                         net_profit = gross_profit - fees
                         
                         # 残高に純利益を加算
@@ -737,9 +739,11 @@ class EnhancedTradingBot:
                         slippage = self.calculate_slippage(is_buy=False)
                         execution_price *= (1 + slippage)
                         
-                        # 手数料を考慮した利益計算
+                        # 手数料を考慮した利益計算 (maker + taker)
                         gross_profit = (execution_price - self.entry_price) * self.trade_quantity
-                        fees = gross_profit * self.taker_fee
+                        entry_fee = self.entry_price * self.trade_quantity * self.maker_fee
+                        exit_fee = execution_price * self.trade_quantity * self.taker_fee
+                        fees = entry_fee + exit_fee
                         net_profit = gross_profit - fees
                         
                         # 残高に純利益を加算
@@ -782,8 +786,11 @@ class EnhancedTradingBot:
             # 最後のポジションがまだ残っている場合、クローズ
             if self.in_position:
                 last_price = df.iloc[-1]['close']
+                # 手数料を考慮した利益計算 (maker + taker)
                 gross_profit = (last_price - self.entry_price) * self.trade_quantity
-                fees = gross_profit * self.taker_fee
+                entry_fee = self.entry_price * self.trade_quantity * self.maker_fee
+                exit_fee = last_price * self.trade_quantity * self.taker_fee
+                fees = entry_fee + exit_fee
                 net_profit = gross_profit - fees
                 
                 balance += net_profit
