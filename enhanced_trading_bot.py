@@ -681,6 +681,12 @@ class EnhancedTradingBot:
                     
                     # シグナルに基づく取引
                     if signal_info.get('signal', 0) == 1 and not self.in_position:
+                        # ATRベースの動的ポジションサイジング
+                        atr_value = current_data.get('ATR', None)
+                        if atr_value and atr_value > 0:
+                            risk_amount = balance * self.risk_per_trade
+                            quantity = risk_amount / atr_value
+                            self.trade_quantity = quantity
                         # 実行価格をシミュレート
                         execution_price = float(next_candle['open'])
                         slippage = self.calculate_slippage(is_buy=True)

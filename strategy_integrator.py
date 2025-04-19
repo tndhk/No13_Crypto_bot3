@@ -83,11 +83,15 @@ class StrategyIntegrator:
         is_high_volatility = atr_ratio > self.config['high_vol_threshold']
         is_low_volatility = atr_ratio < self.config['low_vol_threshold']
         
+        # ボラティリティフィルタは完全スキップせず、重み調整に変更
         # 環境とシグナルに基づく戦略の重み付け
         weights = self._calculate_strategy_weights(
             is_trending, is_high_volatility, is_low_volatility, 
             signals, signal_strengths
         )
+        # 高ボラティリティ時は平均回帰の重みを下げる
+        if is_high_volatility:
+            weights['mean_reversion'] *= 0.5
         
         # 加重平均でシグナルを統合
         weighted_signal = 0
