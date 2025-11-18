@@ -22,6 +22,7 @@ import sys
 import traceback
 from typing import Dict, List, Tuple, Optional, Union, Any
 from config_validator import ConfigValidator, ConfigValidationError
+from risk_manager import RiskManager
 import warnings
 import pickle
 
@@ -115,6 +116,24 @@ class EnhancedTradingBot:
         self.trade_quantity = self.initial_trade_quantity
         self.peak_balance = 10000  # バックテスト初期残高
         self.current_balance = 10000
+        self.day_start_balance = 10000  # 日次損失管理用
+        self.last_trade_date = None
+
+        # 高度なリスク管理の初期化
+        risk_config = {
+            'max_drawdown_percent': float(os.getenv("MAX_DRAWDOWN_PERCENT", "10.0")),
+            'daily_loss_limit_percent': float(os.getenv("DAILY_LOSS_LIMIT_PERCENT", "3.0")),
+            'max_consecutive_losses': int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")),
+            'trailing_stop_activation': float(os.getenv("TRAILING_STOP_ACTIVATION", "1.5")),
+            'trailing_stop_distance': float(os.getenv("TRAILING_STOP_DISTANCE", "0.8")),
+            'partial_take_profit_1': float(os.getenv("PARTIAL_TP_1", "1.5")),
+            'partial_take_profit_1_ratio': float(os.getenv("PARTIAL_TP_1_RATIO", "0.3")),
+            'partial_take_profit_2': float(os.getenv("PARTIAL_TP_2", "3.0")),
+            'partial_take_profit_2_ratio': float(os.getenv("PARTIAL_TP_2_RATIO", "0.3")),
+            'min_adx_for_trend': float(os.getenv("MIN_ADX_FOR_TREND", "25")),
+            'max_adx_for_mean_reversion': float(os.getenv("MAX_ADX_FOR_MR", "20")),
+        }
+        self.risk_manager = RiskManager(risk_config)
         
         # データディレクトリの確認
         self._ensure_directories()
@@ -529,10 +548,32 @@ class EnhancedTradingBot:
         high_low = df['high'] - df['low']
         high_close = abs(df['high'] - df['close'].shift())
         low_close = abs(df['low'] - df['close'].shift())
-        
+
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         df['ATR'] = tr.rolling(14).mean()
-        
+
+        # ADX（Average Directional Index）- トレンド強度指標
+        # +DM と -DM の計算
+        plus_dm = df['high'].diff()
+        minus_dm = -df['low'].diff()
+
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+
+        # スムージング
+        atr_14 = tr.rolling(14).mean()
+        plus_di = 100 * (plus_dm.rolling(14).mean() / atr_14)
+        minus_di = 100 * (minus_dm.rolling(14).mean() / atr_14)
+
+        # DX と ADX
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        df['ADX'] = dx.rolling(14).mean()
+        df['plus_di'] = plus_di
+        df['minus_di'] = minus_di
+
+        # ATR比率（ボラティリティの相対指標）
+        df['atr_ratio'] = df['ATR'] / df['close']
+
         return df
     
     def simulate_intracandle_execution(self, candle_data, stop_loss, take_profit):
@@ -733,7 +774,8 @@ class EnhancedTradingBot:
         return balance, trade
 
     def _process_buy_entry(self, signal_info: Dict, next_candle: pd.Series,
-                           current_price: float, current_data: pd.Series, balance: float) -> Optional[Dict]:
+                           current_price: float, current_data: pd.Series, balance: float,
+                           initial_balance: float = 10000) -> Optional[Dict]:
         """
         買いエントリー処理
 
@@ -749,34 +791,105 @@ class EnhancedTradingBot:
             現在のキャンドルデータ
         balance : float
             現在の残高
+        initial_balance : float
+            初期残高
 
         Returns:
         --------
         dict or None
             取引情報またはNone
         """
+        # リスク管理チェック
+        # 1. ドローダウン制限チェック
+        can_trade, reason = self.risk_manager.check_drawdown_limit(balance, initial_balance)
+        if not can_trade:
+            logger.warning(f"エントリー拒否: {reason}")
+            return None
+
+        # 2. 日次損失制限チェック
+        can_trade, reason = self.risk_manager.check_daily_loss_limit(balance, self.day_start_balance)
+        if not can_trade:
+            logger.warning(f"エントリー拒否: {reason}")
+            return None
+
+        # 3. 連続損失チェック
+        can_trade, size_factor = self.risk_manager.check_consecutive_losses()
+        if not can_trade:
+            logger.warning("エントリー拒否: 連続損失上限到達")
+            return None
+
+        # 4. 市場環境フィルター
+        # ADXとatr_ratioをsignal_infoに追加
+        signal_info_with_market = signal_info.copy()
+        signal_info_with_market['adx'] = current_data.get('ADX', 0)
+        signal_info_with_market['atr_ratio'] = current_data.get('atr_ratio', 0)
+
+        prev_data = pd.DataFrame([current_data])
+        should_skip, skip_reason = self.risk_manager.should_skip_trade(signal_info_with_market, prev_data)
+        if should_skip:
+            logger.debug(f"エントリースキップ: {skip_reason}")
+            return None
+
+        # 5. 高度な市場フィルター（追加データがある場合）
+        # Note: This requires more historical data, so we use a simple check here
+        should_skip_adv, adv_reason = self.risk_manager.advanced_market_filter(signal_info_with_market, prev_data)
+        if should_skip_adv:
+            logger.debug(f"高度フィルターによるスキップ: {adv_reason}")
+            return None
+
+        # 6. エントリー品質チェック
+        entry_timing = self.risk_manager.calculate_optimal_entry_timing(signal_info_with_market, prev_data)
+        if entry_timing['entry_quality'] == 'poor':
+            # 品質が低い場合、シグナル強度をチェック
+            mr_strength = signal_info.get('signal_strengths', {}).get('mean_reversion', 0)
+            if mr_strength < 0.7:  # 非常に強いシグナルでなければスキップ
+                logger.debug(f"エントリー品質不良: {entry_timing['score']}/5")
+                return None
+
         # ATRベースの動的ポジションサイジング
         atr_value = current_data.get('ATR', None)
         if atr_value and atr_value > 0:
+            self.trade_quantity = self.risk_manager.calculate_position_size(balance, atr_value, current_price)
+            # 連続損失による追加縮小
+            self.trade_quantity *= size_factor
+        else:
+            # ATRが無い場合はデフォルト値を使用
             risk_amount = balance * self.risk_per_trade
-            quantity = risk_amount / atr_value
-            self.trade_quantity = quantity
+            self.trade_quantity = risk_amount / (current_price * 0.01) * size_factor
 
         # 実行価格をシミュレート
         execution_price = float(next_candle['open'])
         slippage = self.calculate_slippage(is_buy=True)
         execution_price *= (1 + slippage)
 
-        # リスク/リワード設定
-        sl_percent, tp_percent = self.strategy_integrator.adaptive_risk_reward(
-            signal_info, self.stop_loss_percent, self.take_profit_percent
-        )
+        # リスク/リワード設定（動的計算）
+        signal_strength = abs(signal_info.get('weighted_signal', 0.5))
+        atr_value = current_data.get('ATR', execution_price * 0.01)
+
+        # ATRベースの動的SL/TP
+        if atr_value and atr_value > 0:
+            self.stop_loss = self.risk_manager.calculate_dynamic_stop_loss(
+                execution_price, atr_value, signal_strength
+            )
+            self.take_profit = self.risk_manager.calculate_dynamic_take_profit(
+                execution_price, atr_value, signal_strength
+            )
+            sl_percent = (execution_price - self.stop_loss) / execution_price * 100
+            tp_percent = (self.take_profit - execution_price) / execution_price * 100
+        else:
+            # フォールバック: 従来の方法
+            sl_percent, tp_percent = self.strategy_integrator.adaptive_risk_reward(
+                signal_info, self.stop_loss_percent, self.take_profit_percent
+            )
+            self.stop_loss = execution_price * (1 - sl_percent/100)
+            self.take_profit = execution_price * (1 + tp_percent/100)
 
         # ポジション設定
         self.entry_price = execution_price
-        self.stop_loss = execution_price * (1 - sl_percent/100)
-        self.take_profit = execution_price * (1 + tp_percent/100)
         self.in_position = True
+
+        # リスクマネージャーのポジション状態をリセット
+        self.risk_manager.reset_position_state()
 
         # 主要戦略の特定
         dominant_strategy = max(
@@ -948,11 +1061,16 @@ class EnhancedTradingBot:
             df = self.calculate_indicators(data)
             
             # 初期資本
-            initial_balance = 10000  # USDT
+            initial_balance = float(os.getenv("INITIAL_BALANCE", "10000"))  # USDT
             balance = initial_balance
             self.in_position = False
             self.trades = []
             self.balance_history = [(df.iloc[0]['timestamp'], balance)]
+            self.day_start_balance = initial_balance
+            self.last_trade_date = df.iloc[0]['timestamp'].date()
+
+            # リスクマネージャーの初期化
+            self.risk_manager.peak_balance = initial_balance
             
             # データポイントが十分かチェック
             min_required_points = max(self.long_window, 26) + 5  # MACDのslow=26が最大値
@@ -999,21 +1117,51 @@ class EnhancedTradingBot:
                 
                 # ポジションがある場合のSL/TPチェック
                 if self.in_position:
+                    # トレーリングストップの更新
+                    trailing_stop = self.risk_manager.calculate_trailing_stop(
+                        self.entry_price, current_price, is_long=True
+                    )
+                    if trailing_stop and trailing_stop > self.stop_loss:
+                        self.stop_loss = trailing_stop
+
+                    # 部分利確のチェック
+                    take_qty, remaining_qty = self.risk_manager.check_partial_take_profit(
+                        self.entry_price, current_price, self.trade_quantity
+                    )
+                    if take_qty > 0:
+                        # 部分利確を実行
+                        partial_profit = (current_price - self.entry_price) * take_qty
+                        partial_fee = (self.entry_price * take_qty * self.maker_fee +
+                                       current_price * take_qty * self.taker_fee)
+                        balance += partial_profit - partial_fee
+                        self.trade_quantity = remaining_qty
+                        logger.debug(f"部分利確: {take_qty:.6f} @ {current_price:.2f}")
+
+                    # SL/TPチェック
                     balance, trade = self._process_exit_on_sl_tp(current_data, balance)
                     if trade:
                         self.trades.append(trade)
                         self.in_position = False
+                        # 取引結果を記録（勝敗判定）
+                        is_win = trade.get('net_profit', 0) > 0
+                        self.risk_manager.record_trade_result(is_win)
                 
                 # 次の足でのエントリー
                 next_candle_idx = i + self.execution_delay
                 if next_candle_idx < len(df):
                     next_candle = df.iloc[next_candle_idx]
 
+                    # 日付が変わったら日次残高をリセット
+                    current_date = current_data['timestamp'].date()
+                    if current_date != self.last_trade_date:
+                        self.day_start_balance = balance
+                        self.last_trade_date = current_date
+
                     # シグナルに基づく取引
                     if signal_info.get('signal', 0) == 1 and not self.in_position:
                         # 買いエントリー処理
                         trade_info = self._process_buy_entry(
-                            signal_info, next_candle, current_price, current_data, balance
+                            signal_info, next_candle, current_price, current_data, balance, initial_balance
                         )
                         if trade_info:
                             self.trades.append(trade_info)
@@ -1026,6 +1174,9 @@ class EnhancedTradingBot:
                         self.trades.append(trade)
                         self.in_position = False
                         self.current_trade = {}
+                        # 取引結果を記録（勝敗判定）
+                        is_win = trade.get('net_profit', 0) > 0
+                        self.risk_manager.record_trade_result(is_win)
                 
                 # 残高履歴を更新
                 self.balance_history.append((current_data['timestamp'], balance))
