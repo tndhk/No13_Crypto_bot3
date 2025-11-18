@@ -7,6 +7,7 @@ Optunaによるパラメータ最適化スクリプト
 import os
 import optuna
 from datetime import datetime
+from loguru import logger
 from backtest_runner import run_backtest
 
 
@@ -48,9 +49,9 @@ def main():
     results_file = f"results/optuna_results_{timestamp}.csv"
     df.to_csv(results_file, index=False)
 
-    print("Best parameters:", study.best_params)
-    print("Best balance:", study.best_value)
-    print("Results saved to", results_file)
+    logger.info(f"Best parameters: {study.best_params}")
+    logger.info(f"Best balance: {study.best_value}")
+    logger.info(f"Results saved to {results_file}")
 
 
 if __name__ == "__main__":
