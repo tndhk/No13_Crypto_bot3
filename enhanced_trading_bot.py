@@ -23,6 +23,7 @@ import traceback
 from typing import Dict, List, Tuple, Optional, Union, Any
 from config_validator import ConfigValidator, ConfigValidationError
 from risk_manager import RiskManager
+from advanced_strategy import BuyAndHoldBenchmark, AdaptiveStrategySelector, TrendFollowingStrategy
 import warnings
 import pickle
 
@@ -134,7 +135,11 @@ class EnhancedTradingBot:
             'max_adx_for_mean_reversion': float(os.getenv("MAX_ADX_FOR_MR", "20")),
         }
         self.risk_manager = RiskManager(risk_config)
-        
+
+        # 高度な戦略コンポーネント
+        self.adaptive_selector = AdaptiveStrategySelector()
+        self.trend_strategy = TrendFollowingStrategy()
+
         # データディレクトリの確認
         self._ensure_directories()
 
@@ -1087,14 +1092,34 @@ class EnhancedTradingBot:
                 current_data = df.iloc[i]
                 
                 # 各戦略のシグナルを計算（有効な戦略のみ）
-                trend_signal = self.trend_strategy.generate_signals(prev_data) if self.trend_strategy else {}
+                # 改良版トレンドフォロー戦略を使用
+                trend_signal = self.trend_strategy.generate_signals(prev_data)
                 breakout_signal = self.breakout_strategy.generate_signals(prev_data) if self.breakout_strategy else {}
                 mean_reversion_signal = self.mean_reversion_strategy.generate_signals(prev_data) if self.mean_reversion_strategy else {}
+
+                # 市場レジーム検出
+                regime_info = self.adaptive_selector.detect_market_regime(prev_data)
 
                 # 戦略の統合
                 signal_info = self.strategy_integrator.integrate_strategies(
                     trend_signal, breakout_signal, mean_reversion_signal, prev_data
                 )
+
+                # 適応型重み付けを適用
+                if regime_info['regime'] in ['trending_up', 'trending_down']:
+                    # トレンド相場ではトレンドシグナルを優先
+                    if trend_signal.get('signal', 0) != 0:
+                        trend_strength = trend_signal.get('signal_strength', 0.5)
+                        if trend_strength > 0.5:
+                            # 強いトレンドシグナルがある場合、それを優先
+                            signal_info['signal'] = trend_signal['signal']
+                            signal_info['weighted_signal'] = trend_signal['signal'] * trend_strength
+
+                # 上昇トレンドではショートを避ける（重要）
+                if regime_info['regime'] == 'trending_up' and signal_info.get('signal', 0) == -1:
+                    # ポジションを持っていない場合はショートしない
+                    if not self.in_position:
+                        signal_info['signal'] = 0
                 
                 current_price = current_data['close']
                 
@@ -1208,8 +1233,8 @@ class EnhancedTradingBot:
                     logger.info(f"戦略 '{strategy}': {count}回シグナル発生")
             
             # バックテスト結果の分析と出力
-            self._analyze_backtest_results(initial_balance, balance)
-            
+            self._analyze_backtest_results(initial_balance, balance, df)
+
             # 結果の保存
             self._save_backtest_results(initial_balance, balance, df.iloc[0]['timestamp'], df.iloc[-1]['timestamp'])
             
@@ -1220,11 +1245,16 @@ class EnhancedTradingBot:
             logger.error(traceback.format_exc())
             return None, None
     
-    def _analyze_backtest_results(self, initial_balance, final_balance):
+    def _analyze_backtest_results(self, initial_balance, final_balance, data=None):
         """バックテスト結果の分析と出力"""
         profit = final_balance - initial_balance
         profit_percent = (final_balance / initial_balance - 1) * 100
         annual_return = profit_percent  # バックテスト期間が1年の場合の近似
+
+        # Buy and Hold ベンチマーク計算
+        benchmark_result = {}
+        if data is not None and not data.empty:
+            benchmark_result = BuyAndHoldBenchmark.calculate_performance(data, initial_balance)
         
         # 取引統計
         buy_trades = [t for t in self.trades if t['type'] == 'BUY']
@@ -1280,9 +1310,33 @@ class EnhancedTradingBot:
         total_loss = abs(sum(t.get('net_profit', 0) for t in losing_trades))
         profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
         logger.info(f"プロフィットファクター: {profit_factor:.2f}")
-        
+
         logger.info("=" * 60)
-        
+
+        # Buy and Hold との比較
+        if benchmark_result:
+            logger.info("Buy and Hold ベンチマーク比較")
+            logger.info("-" * 60)
+            bh_return = benchmark_result.get('total_return_percent', 0)
+            bh_dd = benchmark_result.get('max_drawdown_percent', 0)
+
+            logger.info(f"Buy and Hold リターン: {bh_return:.2f}%")
+            logger.info(f"Buy and Hold 最大DD: {bh_dd:.2f}%")
+
+            outperformance = profit_percent - bh_return
+            if outperformance > 0:
+                logger.info(f"戦略の超過リターン: +{outperformance:.2f}% (ベンチマークに勝利)")
+            else:
+                logger.warning(f"戦略の超過リターン: {outperformance:.2f}% (ベンチマークに敗北)")
+
+            # リスク調整後比較
+            if max_drawdown > 0 and bh_dd > 0:
+                strategy_risk_adj = profit_percent / max_drawdown
+                bh_risk_adj = bh_return / bh_dd
+                logger.info(f"リスク調整後リターン: 戦略={strategy_risk_adj:.2f}, BH={bh_risk_adj:.2f}")
+
+            logger.info("=" * 60)
+
         # 戦略別の分析
         self._analyze_strategy_performance()
     
