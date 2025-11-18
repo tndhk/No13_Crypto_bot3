@@ -21,6 +21,7 @@ import json
 import sys
 import traceback
 from typing import Dict, List, Tuple, Optional, Union, Any
+from config_validator import ConfigValidator, ConfigValidationError
 import warnings
 import pickle
 
@@ -112,15 +113,44 @@ class EnhancedTradingBot:
         
         # データディレクトリの確認
         self._ensure_directories()
-        
+
+        # 設定値のバリデーション
+        self._validate_configuration()
+
         # 戦略モジュールのインポート
         self._import_strategies()
-        
+
         # 戦略オブジェクトの初期化
         self._initialize_strategies()
-        
+
         # 設定のログ出力
         self._log_configuration()
+
+    def _validate_configuration(self):
+        """設定値を検証"""
+        try:
+            validator = ConfigValidator()
+            config = {
+                'stop_loss_percent': self.stop_loss_percent,
+                'take_profit_percent': self.take_profit_percent,
+                'quantity': self.trade_quantity,
+                'short_window': self.short_window,
+                'long_window': self.long_window,
+                'maker_fee': self.maker_fee,
+                'taker_fee': self.taker_fee,
+                'slippage_mean': self.slippage_mean,
+                'slippage_std': self.slippage_std,
+                'interval': self.interval,
+            }
+
+            warnings = validator.validate(config)
+
+            for warning in warnings:
+                logger.warning(f"設定警告: {warning}")
+
+        except ConfigValidationError as e:
+            logger.error(f"設定エラー: {e}")
+            raise
     
     def _import_strategies(self):
         """戦略モジュールを動的にインポート"""
@@ -271,23 +301,33 @@ class EnhancedTradingBot:
         """
         # キャッシュファイルパス
         cache_file = f"cache/{self.symbol}_{self.interval}_history.pkl"
-        
+
         # キャッシュを使用する場合はキャッシュをロード
         if self.use_cached_data and is_backtest and os.path.exists(cache_file):
-            with open(cache_file, 'rb') as f:
-                data = pickle.load(f)
-                logger.info(f"キャッシュからデータをロード: {len(data)} ロウソク足")
-                
-                # 日付範囲でフィルタリング
-                if start_time is not None:
-                    start_dt = pd.to_datetime(start_time)
-                    data = data[data['timestamp'] >= start_dt]
-                
-                if end_time is not None:
-                    end_dt = pd.to_datetime(end_time)
-                    data = data[data['timestamp'] <= end_dt]
-                
-                return data
+            try:
+                with open(cache_file, 'rb') as f:
+                    data = pickle.load(f)
+                    logger.info(f"キャッシュからデータをロード: {len(data)} ロウソク足")
+
+                    # 日付範囲でフィルタリング
+                    if start_time is not None:
+                        start_dt = pd.to_datetime(start_time)
+                        data = data[data['timestamp'] >= start_dt]
+
+                    if end_time is not None:
+                        end_dt = pd.to_datetime(end_time)
+                        data = data[data['timestamp'] <= end_dt]
+
+                    if data.empty:
+                        logger.warning("キャッシュデータが指定期間内に存在しません")
+
+                    return data
+            except (pickle.UnpicklingError, EOFError) as e:
+                logger.error(f"キャッシュファイルの読み込みに失敗: {e}")
+                logger.info("APIからデータを再取得します")
+            except Exception as e:
+                logger.error(f"キャッシュ読み込み時の予期しないエラー: {e}")
+                logger.info("APIからデータを再取得します")
 
         # キャッシュが無い場合やライブモードの場合はAPIから取得
         # start_time, end_time を datetime に変換
@@ -295,10 +335,18 @@ class EnhancedTradingBot:
         end_dt = pd.to_datetime(end_time) if end_time else None
         
         logger.info(f"APIからデータをループで取得: {self.symbol}, {self.interval}")
-        
+
         all_data = []
         current_time = start_dt
-        self._initialize_client()
+
+        try:
+            self._initialize_client()
+        except Exception as e:
+            logger.error(f"APIクライアントの初期化に失敗: {e}")
+            return pd.DataFrame()
+
+        retry_count = 0
+        max_retries = 3
 
         while current_time < end_dt:
             # Binance API は最大1000本のデータを一度に取得可能
@@ -306,43 +354,62 @@ class EnhancedTradingBot:
             if next_time > end_dt:
                 next_time = end_dt
 
-            klines = self.client.get_historical_klines(
-                symbol=self.symbol,
-                interval=self.interval,
-                start_str=current_time.strftime("%Y-%m-%d %H:%M:%S"),
-                end_str=next_time.strftime("%Y-%m-%d %H:%M:%S"),
-                limit=1000
-            )
+            try:
+                klines = self.client.get_historical_klines(
+                    symbol=self.symbol,
+                    interval=self.interval,
+                    start_str=current_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    end_str=next_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    limit=1000
+                )
 
-            if not klines:
+                if not klines:
+                    break
+
+                df = pd.DataFrame(klines, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_asset_volume', 'number_of_trades',
+                    'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+                ])
+
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+
+                all_data.append(df)
+                current_time = df['timestamp'].iloc[-1] + pd.Timedelta(hours=1)  # 次の開始時刻
+                retry_count = 0  # 成功したらリセット
+
+            except BinanceAPIException as e:
+                logger.error(f"Binance APIエラー: {e}")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(f"最大リトライ回数 ({max_retries}) に達しました")
+                    break
+                wait_time = 2 ** retry_count
+                logger.info(f"{wait_time}秒後にリトライします...")
+                time.sleep(wait_time)
+                continue
+            except Exception as e:
+                logger.error(f"データ取得中の予期しないエラー: {e}")
                 break
-
-            df = pd.DataFrame(klines, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-            ])
-
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
-
-            all_data.append(df)
-            current_time = df['timestamp'].iloc[-1] + pd.Timedelta(hours=1)  # 次の開始時刻
 
             time.sleep(0.3)  # API制限対策
 
         if all_data:
-            full_data = pd.concat(all_data).drop_duplicates('timestamp').sort_values('timestamp')
-            
-            # キャッシュ保存（オプション）
-            if is_backtest:
-                os.makedirs("cache", exist_ok=True)
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(full_data, f)
-                logger.info(f"キャッシュ保存完了: {len(full_data)} ロウソク足")
+            try:
+                full_data = pd.concat(all_data).drop_duplicates('timestamp').sort_values('timestamp')
 
-            return full_data
+                # キャッシュ保存（オプション）
+                if is_backtest:
+                    os.makedirs("cache", exist_ok=True)
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(full_data, f)
+                    logger.info(f"キャッシュ保存完了: {len(full_data)} ロウソク足")
+
+                return full_data
+            except Exception as e:
+                logger.error(f"データ結合/保存中のエラー: {e}")
 
         return pd.DataFrame()
     
@@ -556,6 +623,273 @@ class EnhancedTradingBot:
             duration = (end_time - start_time).total_seconds() / 3600  # 時間に変換
             return round(duration, 1)
         return 0
+
+    def _calculate_trade_profit(self, entry_price: float, exit_price: float, quantity: float) -> Dict[str, float]:
+        """
+        取引の利益を計算
+
+        Parameters:
+        -----------
+        entry_price : float
+            エントリー価格
+        exit_price : float
+            エグジット価格
+        quantity : float
+            取引数量
+
+        Returns:
+        --------
+        dict
+            gross_profit, net_profit, fees, profit_percent を含む辞書
+        """
+        gross_profit = (exit_price - entry_price) * quantity
+        entry_fee = entry_price * quantity * self.maker_fee
+        exit_fee = exit_price * quantity * self.taker_fee
+        fees = entry_fee + exit_fee
+        net_profit = gross_profit - fees
+        profit_percent = (exit_price / entry_price - 1) * 100
+
+        return {
+            'gross_profit': gross_profit,
+            'net_profit': net_profit,
+            'fees': fees,
+            'profit_percent': profit_percent
+        }
+
+    def _process_exit_on_sl_tp(self, current_data: pd.Series, balance: float) -> Tuple[float, Optional[Dict]]:
+        """
+        ストップロス/テイクプロフィットによるエグジット処理
+
+        Parameters:
+        -----------
+        current_data : pd.Series
+            現在のキャンドルデータ
+        balance : float
+            現在の残高
+
+        Returns:
+        --------
+        tuple
+            (更新された残高, 取引情報またはNone)
+        """
+        exit_reason, exit_price = self.simulate_intracandle_execution(
+            current_data, self.stop_loss, self.take_profit
+        )
+
+        if not exit_reason:
+            return balance, None
+
+        # スリッページを適用
+        slippage = self.calculate_slippage(is_buy=False)
+        execution_price = exit_price * (1 + slippage)
+
+        # 利益計算
+        profit_info = self._calculate_trade_profit(
+            self.entry_price, execution_price, self.trade_quantity
+        )
+
+        # 残高更新
+        balance += profit_info['net_profit']
+
+        # 取引記録
+        trade = {
+            'type': 'SELL',
+            'timestamp': current_data['timestamp'],
+            'execution_price': execution_price,
+            'quantity': self.trade_quantity,
+            'gross_profit': profit_info['gross_profit'],
+            'net_profit': profit_info['net_profit'],
+            'fees': profit_info['fees'],
+            'profit_percent': profit_info['profit_percent'],
+            'reason': exit_reason,
+            'strategy': self.current_trade.get('strategy', 'unknown')
+        }
+
+        return balance, trade
+
+    def _process_buy_entry(self, signal_info: Dict, next_candle: pd.Series,
+                           current_price: float, current_data: pd.Series, balance: float) -> Optional[Dict]:
+        """
+        買いエントリー処理
+
+        Parameters:
+        -----------
+        signal_info : dict
+            シグナル情報
+        next_candle : pd.Series
+            次のキャンドルデータ
+        current_price : float
+            現在価格
+        current_data : pd.Series
+            現在のキャンドルデータ
+        balance : float
+            現在の残高
+
+        Returns:
+        --------
+        dict or None
+            取引情報またはNone
+        """
+        # ATRベースの動的ポジションサイジング
+        atr_value = current_data.get('ATR', None)
+        if atr_value and atr_value > 0:
+            risk_amount = balance * self.risk_per_trade
+            quantity = risk_amount / atr_value
+            self.trade_quantity = quantity
+
+        # 実行価格をシミュレート
+        execution_price = float(next_candle['open'])
+        slippage = self.calculate_slippage(is_buy=True)
+        execution_price *= (1 + slippage)
+
+        # リスク/リワード設定
+        sl_percent, tp_percent = self.strategy_integrator.adaptive_risk_reward(
+            signal_info, self.stop_loss_percent, self.take_profit_percent
+        )
+
+        # ポジション設定
+        self.entry_price = execution_price
+        self.stop_loss = execution_price * (1 - sl_percent/100)
+        self.take_profit = execution_price * (1 + tp_percent/100)
+        self.in_position = True
+
+        # 主要戦略の特定
+        dominant_strategy = max(
+            signal_info.get('strategy_weights', {}),
+            key=lambda k: signal_info['strategy_weights'][k] if signal_info['strategy_signals'][k] != 0 else 0
+        )
+
+        # 取引情報
+        trade_info = {
+            'type': 'BUY',
+            'timestamp': next_candle['timestamp'],
+            'signal_timestamp': current_data['timestamp'],
+            'signal_price': current_price,
+            'execution_price': execution_price,
+            'quantity': self.trade_quantity,
+            'slippage_percent': (execution_price / float(next_candle['open']) - 1) * 100,
+            'stop_loss': self.stop_loss,
+            'take_profit': self.take_profit,
+            'sl_percent': sl_percent,
+            'tp_percent': tp_percent,
+            'reason': signal_info.get('signal_reason', f'戦略: {dominant_strategy}'),
+            'strategy': dominant_strategy
+        }
+
+        self.current_trade = trade_info
+        return trade_info
+
+    def _process_sell_exit(self, signal_info: Dict, next_candle: pd.Series,
+                           current_price: float, current_data: pd.Series, balance: float) -> Tuple[float, Dict]:
+        """
+        売りエグジット処理
+
+        Parameters:
+        -----------
+        signal_info : dict
+            シグナル情報
+        next_candle : pd.Series
+            次のキャンドルデータ
+        current_price : float
+            現在価格
+        current_data : pd.Series
+            現在のキャンドルデータ
+        balance : float
+            現在の残高
+
+        Returns:
+        --------
+        tuple
+            (更新された残高, 取引情報)
+        """
+        # 実行価格をシミュレート
+        execution_price = float(next_candle['open'])
+        slippage = self.calculate_slippage(is_buy=False)
+        execution_price *= (1 + slippage)
+
+        # 利益計算
+        profit_info = self._calculate_trade_profit(
+            self.entry_price, execution_price, self.trade_quantity
+        )
+
+        # 残高更新
+        balance += profit_info['net_profit']
+
+        # 主要戦略の特定
+        dominant_strategy = max(
+            signal_info.get('strategy_weights', {}),
+            key=lambda k: signal_info['strategy_weights'][k] if signal_info['strategy_signals'][k] != 0 else 0
+        )
+
+        trade = {
+            'type': 'SELL',
+            'timestamp': next_candle['timestamp'],
+            'signal_timestamp': current_data['timestamp'],
+            'signal_price': current_price,
+            'execution_price': execution_price,
+            'quantity': self.trade_quantity,
+            'gross_profit': profit_info['gross_profit'],
+            'net_profit': profit_info['net_profit'],
+            'fees': profit_info['fees'],
+            'profit_percent': profit_info['profit_percent'],
+            'reason': signal_info.get('signal_reason', f'戦略: {dominant_strategy}'),
+            'strategy': dominant_strategy,
+            'entry_price': self.entry_price,
+            'hold_duration': self._calculate_hold_duration(
+                self.current_trade.get('timestamp', current_data['timestamp']),
+                next_candle['timestamp']
+            )
+        }
+
+        return balance, trade
+
+    def _close_final_position(self, df: pd.DataFrame, balance: float) -> float:
+        """
+        最終ポジションをクローズ
+
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            データフレーム
+        balance : float
+            現在の残高
+
+        Returns:
+        --------
+        float
+            更新された残高
+        """
+        last_price = df.iloc[-1]['close']
+
+        # 利益計算
+        profit_info = self._calculate_trade_profit(
+            self.entry_price, last_price, self.trade_quantity
+        )
+
+        balance += profit_info['net_profit']
+
+        self.trades.append({
+            'type': 'SELL',
+            'timestamp': df.iloc[-1]['timestamp'],
+            'execution_price': last_price,
+            'quantity': self.trade_quantity,
+            'gross_profit': profit_info['gross_profit'],
+            'net_profit': profit_info['net_profit'],
+            'fees': profit_info['fees'],
+            'profit_percent': profit_info['profit_percent'],
+            'reason': 'バックテスト終了',
+            'strategy': self.current_trade.get('strategy', 'unknown'),
+            'entry_price': self.entry_price,
+            'hold_duration': self._calculate_hold_duration(
+                self.current_trade.get('timestamp', df.iloc[-1]['timestamp']),
+                df.iloc[-1]['timestamp']
+            )
+        })
+
+        self.in_position = False
+        self.current_trade = {}
+
+        return balance
     
     def run_backtest(self):
         """
@@ -640,141 +974,31 @@ class EnhancedTradingBot:
                 
                 # ポジションがある場合のSL/TPチェック
                 if self.in_position:
-                    # 既存のSL/TPチェックロジック
-                    exit_reason, exit_price = self.simulate_intracandle_execution(
-                        current_data, self.stop_loss, self.take_profit
-                    )
-                    
-                    if exit_reason:
-                        # スリッページを適用
-                        slippage = self.calculate_slippage(is_buy=False)
-                        execution_price = exit_price * (1 + slippage)
-                        
-                        # 手数料を考慮した利益計算 (maker + taker)
-                        gross_profit = (execution_price - self.entry_price) * self.trade_quantity
-                        entry_fee = self.entry_price * self.trade_quantity * self.maker_fee
-                        exit_fee = execution_price * self.trade_quantity * self.taker_fee
-                        fees = entry_fee + exit_fee
-                        net_profit = gross_profit - fees
-                        
-                        # 残高に純利益を加算
-                        balance += net_profit
-                        
-                        # 取引情報
-                        self.trades.append({
-                            'type': 'SELL',
-                            'timestamp': current_data['timestamp'],
-                            'execution_price': execution_price,
-                            'quantity': self.trade_quantity,
-                            'gross_profit': gross_profit,
-                            'net_profit': net_profit,
-                            'fees': fees,
-                            'profit_percent': (execution_price / self.entry_price - 1) * 100,
-                            'reason': exit_reason,
-                            'strategy': self.current_trade.get('strategy', 'unknown')
-                        })
-                        
+                    balance, trade = self._process_exit_on_sl_tp(current_data, balance)
+                    if trade:
+                        self.trades.append(trade)
                         self.in_position = False
                 
                 # 次の足でのエントリー
                 next_candle_idx = i + self.execution_delay
                 if next_candle_idx < len(df):
                     next_candle = df.iloc[next_candle_idx]
-                    
+
                     # シグナルに基づく取引
                     if signal_info.get('signal', 0) == 1 and not self.in_position:
-                        # ATRベースの動的ポジションサイジング
-                        atr_value = current_data.get('ATR', None)
-                        if atr_value and atr_value > 0:
-                            risk_amount = balance * self.risk_per_trade
-                            quantity = risk_amount / atr_value
-                            self.trade_quantity = quantity
-                        # 実行価格をシミュレート
-                        execution_price = float(next_candle['open'])
-                        slippage = self.calculate_slippage(is_buy=True)
-                        execution_price *= (1 + slippage)
-                        
-                        # リスク/リワード設定
-                        sl_percent, tp_percent = self.strategy_integrator.adaptive_risk_reward(
-                            signal_info, self.stop_loss_percent, self.take_profit_percent
+                        # 買いエントリー処理
+                        trade_info = self._process_buy_entry(
+                            signal_info, next_candle, current_price, current_data, balance
                         )
-                        
-                        # 買い注文を実行
-                        self.entry_price = execution_price
-                        self.stop_loss = execution_price * (1 - sl_percent/100)
-                        self.take_profit = execution_price * (1 + tp_percent/100)
-                        self.in_position = True
-                        
-                        # 主要戦略の特定
-                        dominant_strategy = max(
-                            signal_info.get('strategy_weights', {}), 
-                            key=lambda k: signal_info['strategy_weights'][k] if signal_info['strategy_signals'][k] != 0 else 0
-                        )
-                        
-                        # トレード情報
-                        trade_info = {
-                            'type': 'BUY',
-                            'timestamp': next_candle['timestamp'],
-                            'signal_timestamp': current_data['timestamp'],
-                            'signal_price': current_price,
-                            'execution_price': execution_price,
-                            'quantity': self.trade_quantity,
-                            'slippage_percent': (execution_price / float(next_candle['open']) - 1) * 100,
-                            'stop_loss': self.stop_loss,
-                            'take_profit': self.take_profit,
-                            'sl_percent': sl_percent,
-                            'tp_percent': tp_percent,
-                            'reason': signal_info.get('signal_reason', f'戦略: {dominant_strategy}'),
-                            'strategy': dominant_strategy
-                        }
-                        
-                        self.trades.append(trade_info)
-                        
-                        # 現在の取引情報を更新
-                        self.current_trade = trade_info
-                        
+                        if trade_info:
+                            self.trades.append(trade_info)
+
                     elif signal_info.get('signal', 0) == -1 and self.in_position:
-                        # 実行価格をシミュレート
-                        execution_price = float(next_candle['open'])
-                        slippage = self.calculate_slippage(is_buy=False)
-                        execution_price *= (1 + slippage)
-                        
-                        # 手数料を考慮した利益計算 (maker + taker)
-                        gross_profit = (execution_price - self.entry_price) * self.trade_quantity
-                        entry_fee = self.entry_price * self.trade_quantity * self.maker_fee
-                        exit_fee = execution_price * self.trade_quantity * self.taker_fee
-                        fees = entry_fee + exit_fee
-                        net_profit = gross_profit - fees
-                        
-                        # 残高に純利益を加算
-                        balance += net_profit
-                        
-                        # 主要戦略の特定
-                        dominant_strategy = max(
-                            signal_info.get('strategy_weights', {}), 
-                            key=lambda k: signal_info['strategy_weights'][k] if signal_info['strategy_signals'][k] != 0 else 0
+                        # 売りエグジット処理
+                        balance, trade = self._process_sell_exit(
+                            signal_info, next_candle, current_price, current_data, balance
                         )
-                        
-                        self.trades.append({
-                            'type': 'SELL',
-                            'timestamp': next_candle['timestamp'],
-                            'signal_timestamp': current_data['timestamp'],
-                            'signal_price': current_price,
-                            'execution_price': execution_price,
-                            'quantity': self.trade_quantity,
-                            'gross_profit': gross_profit,
-                            'net_profit': net_profit,
-                            'fees': fees,
-                            'profit_percent': (execution_price / self.entry_price - 1) * 100,
-                            'reason': signal_info.get('signal_reason', f'戦略: {dominant_strategy}'),
-                            'strategy': dominant_strategy,
-                            'entry_price': self.entry_price,
-                            'hold_duration': self._calculate_hold_duration(
-                                self.current_trade.get('timestamp', current_data['timestamp']), 
-                                next_candle['timestamp']
-                            )
-                        })
-                        
+                        self.trades.append(trade)
                         self.in_position = False
                         self.current_trade = {}
                 
@@ -785,37 +1009,7 @@ class EnhancedTradingBot:
             
             # 最後のポジションがまだ残っている場合、クローズ
             if self.in_position:
-                last_price = df.iloc[-1]['close']
-                # 手数料を考慮した利益計算 (maker + taker)
-                gross_profit = (last_price - self.entry_price) * self.trade_quantity
-                entry_fee = self.entry_price * self.trade_quantity * self.maker_fee
-                exit_fee = last_price * self.trade_quantity * self.taker_fee
-                fees = entry_fee + exit_fee
-                net_profit = gross_profit - fees
-                
-                balance += net_profit
-                
-                self.trades.append({
-                    'type': 'SELL',
-                    'timestamp': df.iloc[-1]['timestamp'],
-                    'execution_price': last_price,
-                    'quantity': self.trade_quantity,
-                    'gross_profit': gross_profit,
-                    'net_profit': net_profit,
-                    'fees': fees,
-                    'profit_percent': (last_price / self.entry_price - 1) * 100,
-                    'reason': 'バックテスト終了',
-                    'strategy': self.current_trade.get('strategy', 'unknown'),
-                    'entry_price': self.entry_price,
-                    'hold_duration': self._calculate_hold_duration(
-                        self.current_trade.get('timestamp', df.iloc[-1]['timestamp']), 
-                        df.iloc[-1]['timestamp']
-                    )
-                })
-                
-                self.in_position = False
-                self.current_trade = {}
-                
+                balance = self._close_final_position(df, balance)
                 # 最終残高を更新
                 self.balance_history.append((df.iloc[-1]['timestamp'], balance))
             
