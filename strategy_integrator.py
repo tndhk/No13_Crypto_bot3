@@ -27,6 +27,12 @@ class StrategyIntegrator:
             'low_vol_threshold': 0.006,  # 低ボラティリティ閾値
             'strong_signal_threshold': 0.7, # 強いシグナル閾値
             'very_strong_signal_threshold': 0.8, # 非常に強いシグナル閾値
+            # エントリー条件の厳格化
+            'require_multiple_confirmation': True,  # 複数確認要求
+            'min_confirmations': 2,  # 最小確認数
+            'use_false_signal_filter': True,  # ダマシフィルター使用
+            'volume_confirmation': True,  # 出来高確認
+            'min_volume_ratio': 0.8,  # 最小出来高比率
         }
         
         # 設定の上書き
@@ -113,7 +119,26 @@ class StrategyIntegrator:
             # 平均回帰が非常に強力な場合、他の戦略からの反対意見があっても考慮
             if weighted_signal * signals['mean_reversion'] > 0:  # 同じ方向
                 final_signal = signals['mean_reversion']
-        
+
+        # エントリー条件の厳格化
+        # 1. 複数確認フィルター
+        if self.config['require_multiple_confirmation'] and final_signal != 0:
+            confirmations = self._count_confirmations(current, final_signal)
+            if confirmations < self.config['min_confirmations']:
+                final_signal = 0  # 確認不足でシグナルを無効化
+
+        # 2. ダマシフィルター
+        if self.config['use_false_signal_filter'] and final_signal != 0:
+            if self._is_false_signal(current, final_signal, data):
+                final_signal = 0  # ダマシと判定
+
+        # 3. 出来高確認
+        if self.config['volume_confirmation'] and final_signal != 0:
+            if not self._confirm_volume(current):
+                # 出来高不足の場合、シグナル強度を確認
+                if signal_strengths.get('mean_reversion', 0) < self.config['strong_signal_threshold']:
+                    final_signal = 0  # 出来高不足かつシグナル弱い
+
         # 理由文字列の生成
         signal_reason = self._generate_signal_reason(
             final_signal, signals, weights, is_trending, atr_ratio,
@@ -368,5 +393,129 @@ class StrategyIntegrator:
         # 最低リスク/リワード比の保証
         if tp_percent / sl_percent < min_risk_reward:
             tp_percent = sl_percent * min_risk_reward
-        
+
         return sl_percent, tp_percent
+
+    def _count_confirmations(self, current, signal_direction):
+        """
+        複数の指標からの確認数をカウント
+
+        Parameters:
+        -----------
+        current : pd.Series
+            現在のデータポイント
+        signal_direction : int
+            シグナル方向（1: 買い, -1: 売り）
+
+        Returns:
+        --------
+        int
+            確認数
+        """
+        confirmations = 0
+
+        # RSI確認
+        rsi = current.get('RSI', 50)
+        if signal_direction == 1 and rsi < 50:  # 買いシグナルで RSI < 50
+            confirmations += 1
+        elif signal_direction == -1 and rsi > 50:  # 売りシグナルで RSI > 50
+            confirmations += 1
+
+        # MACD確認
+        macd_hist = current.get('MACD_hist', 0)
+        if signal_direction == 1 and macd_hist > 0:  # 買いシグナルで MACD ヒストグラム正
+            confirmations += 1
+        elif signal_direction == -1 and macd_hist < 0:  # 売りシグナルで MACD ヒストグラム負
+            confirmations += 1
+
+        # ボリンジャーバンド確認
+        close = current.get('close', 0)
+        bb_middle = current.get('BB_middle', close)
+        if signal_direction == 1 and close < bb_middle:  # 買いシグナルで価格が中央線以下
+            confirmations += 1
+        elif signal_direction == -1 and close > bb_middle:  # 売りシグナルで価格が中央線以上
+            confirmations += 1
+
+        # 移動平均確認
+        sma_short = current.get('SMA_short', close)
+        sma_long = current.get('SMA_long', close)
+        if signal_direction == 1 and sma_short < sma_long:  # 買いシグナルでゴールデンクロスの可能性
+            confirmations += 1
+        elif signal_direction == -1 and sma_short > sma_long:  # 売りシグナルでデッドクロスの可能性
+            confirmations += 1
+
+        return confirmations
+
+    def _is_false_signal(self, current, signal_direction, data):
+        """
+        ダマシシグナルかどうかを判定
+
+        Parameters:
+        -----------
+        current : pd.Series
+            現在のデータポイント
+        signal_direction : int
+            シグナル方向
+        data : pd.DataFrame
+            過去データ
+
+        Returns:
+        --------
+        bool
+            ダマシの場合True
+        """
+        if len(data) < 5:
+            return False
+
+        # 1. 急激な価格変動後のリバーサル（ダマシの可能性）
+        recent_data = data.tail(5)
+        price_change = (current['close'] - recent_data['close'].iloc[0]) / recent_data['close'].iloc[0]
+
+        # 買いシグナルで価格が急上昇中（ダマシ）
+        if signal_direction == 1 and price_change > 0.02:  # 2%以上上昇
+            return True
+        # 売りシグナルで価格が急下落中（ダマシ）
+        if signal_direction == -1 and price_change < -0.02:  # 2%以上下落
+            return True
+
+        # 2. 連続した反対シグナルの後（ダマシの可能性）
+        # 直前のキャンドルが現在のシグナルと逆方向に大きく動いた場合
+        prev_candle = data.iloc[-2] if len(data) >= 2 else current
+        candle_body = (current['close'] - current['open']) / current['open']
+
+        if signal_direction == 1 and candle_body < -0.01:  # 買いシグナルで陰線
+            return True
+        if signal_direction == -1 and candle_body > 0.01:  # 売りシグナルで陽線
+            return True
+
+        # 3. 極端なRSI値でのエントリー回避
+        rsi = current.get('RSI', 50)
+        if signal_direction == 1 and rsi > 65:  # 買いシグナルでRSIが高すぎる
+            return True
+        if signal_direction == -1 and rsi < 35:  # 売りシグナルでRSIが低すぎる
+            return True
+
+        return False
+
+    def _confirm_volume(self, current):
+        """
+        出来高が十分かどうか確認
+
+        Parameters:
+        -----------
+        current : pd.Series
+            現在のデータポイント
+
+        Returns:
+        --------
+        bool
+            出来高が十分な場合True
+        """
+        volume = current.get('volume', 0)
+        volume_ma = current.get('volume_ma', volume)
+
+        if volume_ma <= 0:
+            return True  # 移動平均が無い場合はスキップ
+
+        volume_ratio = volume / volume_ma
+        return volume_ratio >= self.config['min_volume_ratio']
