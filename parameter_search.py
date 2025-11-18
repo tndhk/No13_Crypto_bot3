@@ -8,6 +8,7 @@ import os
 import csv
 import itertools
 from datetime import datetime
+from loguru import logger
 from backtest_runner import run_backtest
 
 
@@ -39,12 +40,12 @@ def main():
             for k, v in params.items():
                 os.environ[k] = str(v)
 
-            print(f"Testing params: {params}")
+            logger.debug(f"Testing params: {params}")
             balance, trades, _ = run_backtest()
             # balanceがNoneの場合はスキップまたは0として扱う
             writer.writerow([params[k] for k in keys] + [balance if balance is not None else 0])
 
-    print(f"探索結果を保存しました: {results_file}")
+    logger.info(f"探索結果を保存しました: {results_file}")
 
 
 if __name__ == "__main__":

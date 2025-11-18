@@ -73,6 +73,11 @@ class EnhancedTradingBot:
         self.use_complex_signal = os.getenv("USE_COMPLEX_SIGNAL", "true").lower() == "true"
         self.use_price_simulation = os.getenv("USE_PRICE_SIMULATION", "true").lower() == "true"
         self.use_multi_strategy = os.getenv("USE_MULTI_STRATEGY", "true").lower() == "true"
+
+        # 戦略の有効/無効設定
+        self.enable_mean_reversion = os.getenv("ENABLE_MEAN_REVERSION", "true").lower() == "true"
+        self.enable_trend = os.getenv("ENABLE_TREND", "false").lower() == "true"
+        self.enable_breakout = os.getenv("ENABLE_BREAKOUT", "false").lower() == "true"
         
         # コストとスリッページ設定
         self.maker_fee = float(os.getenv("MAKER_FEE", "0.0010"))
@@ -181,46 +186,65 @@ class EnhancedTradingBot:
     
     def _initialize_strategies(self):
         """戦略オブジェクトを初期化"""
+        # 有効な戦略リスト
+        self.enabled_strategies = []
+
         # Mean Reversion戦略の設定
-        mr_config = {
-            'rsi_upper': float(os.getenv("MR_RSI_UPPER", "65")),
-            'rsi_lower': float(os.getenv("MR_RSI_LOWER", "35")),
-            'rsi_extreme_upper': float(os.getenv("MR_RSI_EXTREME_UPPER", "75")),
-            'rsi_extreme_lower': float(os.getenv("MR_RSI_EXTREME_LOWER", "25")),
-            'bb_upper_factor': float(os.getenv("MR_BB_UPPER_FACTOR", "1.003")),
-            'bb_lower_factor': float(os.getenv("MR_BB_LOWER_FACTOR", "0.997")),
-            'z_score_threshold': float(os.getenv("MR_Z_SCORE_THRESHOLD", "1.5")),
-            'ma_deviation': float(os.getenv("MR_MA_DEVIATION", "0.015")),
-            'price_bounce': float(os.getenv("MR_PRICE_BOUNCE", "0.002")),
-            'lookback_period': 20,
-        }
-        
+        if self.enable_mean_reversion:
+            mr_config = {
+                'rsi_upper': float(os.getenv("MR_RSI_UPPER", "65")),
+                'rsi_lower': float(os.getenv("MR_RSI_LOWER", "35")),
+                'rsi_extreme_upper': float(os.getenv("MR_RSI_EXTREME_UPPER", "75")),
+                'rsi_extreme_lower': float(os.getenv("MR_RSI_EXTREME_LOWER", "25")),
+                'bb_upper_factor': float(os.getenv("MR_BB_UPPER_FACTOR", "1.003")),
+                'bb_lower_factor': float(os.getenv("MR_BB_LOWER_FACTOR", "0.997")),
+                'z_score_threshold': float(os.getenv("MR_Z_SCORE_THRESHOLD", "1.5")),
+                'ma_deviation': float(os.getenv("MR_MA_DEVIATION", "0.015")),
+                'price_bounce': float(os.getenv("MR_PRICE_BOUNCE", "0.002")),
+                'lookback_period': 20,
+            }
+            self.enabled_strategies.append('mean_reversion')
+        else:
+            mr_config = None
+
         # トレンド戦略の設定
-        # trend_config = {
-        #     'short_window': self.short_window,
-        #     'long_window': self.long_window,
-        #     'adx_threshold': 25,
-        # }
-        
+        if self.enable_trend:
+            trend_config = {
+                'short_window': self.short_window,
+                'long_window': self.long_window,
+                'adx_threshold': float(os.getenv("TREND_ADX_THRESHOLD", "25")),
+            }
+            self.enabled_strategies.append('trend')
+        else:
+            trend_config = None
+
         # ブレイクアウト戦略の設定
-        breakout_config = {
-            'lookback_period': 20,
-            'breakout_threshold': 0.002,
-        }
-        
+        if self.enable_breakout:
+            breakout_config = {
+                'lookback_period': int(os.getenv("BREAKOUT_LOOKBACK", "20")),
+                'breakout_threshold': float(os.getenv("BREAKOUT_THRESHOLD", "0.002")),
+            }
+            self.enabled_strategies.append('breakout')
+        else:
+            breakout_config = None
+
         # 戦略統合の設定
         integrator_config = {
             'buy_threshold': float(os.getenv("STRATEGY_BUY_THRESHOLD", "0.25")),
             'sell_threshold': float(os.getenv("STRATEGY_SELL_THRESHOLD", "-0.25")),
             'adx_threshold': float(os.getenv("STRATEGY_ADX_THRESHOLD", "25")),
         }
-        
+
         # 戦略オブジェクトの作成
         try:
-            self.mean_reversion_strategy = MeanReversionStrategy(mr_config)
-            # self.trend_strategy = TrendStrategy(trend_config)
-            self.breakout_strategy = BreakoutStrategy(breakout_config)
+            self.mean_reversion_strategy = MeanReversionStrategy(mr_config) if mr_config else None
+            self.trend_strategy = TrendStrategy(trend_config) if trend_config else None
+            self.breakout_strategy = BreakoutStrategy(breakout_config) if breakout_config else None
             self.strategy_integrator = StrategyIntegrator(integrator_config)
+
+            if not self.enabled_strategies:
+                logger.warning("有効な戦略がありません。少なくとも1つの戦略を有効にしてください。")
+
         except NameError as e:
             logger.error(f"戦略クラスの初期化に失敗しました: {e}")
             logger.error("strategies モジュールが正しくインポートされているか確認してください")
@@ -230,10 +254,11 @@ class EnhancedTradingBot:
         """現在の設定をログに出力"""
         logger.info(f"=== 強化ボット設定 ===")
         logger.info(f"取引ペア: {self.symbol}, インターバル: {self.interval}")
-        logger.info(f"戦略: Multi-Strategy with Enhanced Mean Reversion")
+        logger.info(f"有効な戦略: {', '.join(self.enabled_strategies) if self.enabled_strategies else 'なし'}")
         logger.info(f"移動平均: 短期={self.short_window}, 長期={self.long_window}")
         logger.info(f"リスク設定: SL={self.stop_loss_percent}%, TP={self.take_profit_percent}%")
-        logger.info(f"平均回帰戦略強化: RSI閾値={self.mean_reversion_strategy.config['rsi_lower']}/{self.mean_reversion_strategy.config['rsi_upper']}")
+        if self.mean_reversion_strategy:
+            logger.info(f"平均回帰戦略: RSI閾値={self.mean_reversion_strategy.config['rsi_lower']}/{self.mean_reversion_strategy.config['rsi_upper']}")
         logger.info(f"シグナル閾値: 買い={self.strategy_integrator.config['buy_threshold']}, 売り={self.strategy_integrator.config['sell_threshold']}")
         logger.info(f"価格シミュレーション: {'有効' if self.use_price_simulation else '無効'}")
         logger.info("=" * 30)
@@ -943,14 +968,14 @@ class EnhancedTradingBot:
                 prev_data = df.iloc[:i+1]
                 current_data = df.iloc[i]
                 
-                # 各戦略のシグナルを計算
-                # trend_signal = self.trend_strategy.generate_signals(prev_data)
-                breakout_signal = {} # 常に空のシグナル
-                mean_reversion_signal = self.mean_reversion_strategy.generate_signals(prev_data)
-                
+                # 各戦略のシグナルを計算（有効な戦略のみ）
+                trend_signal = self.trend_strategy.generate_signals(prev_data) if self.trend_strategy else {}
+                breakout_signal = self.breakout_strategy.generate_signals(prev_data) if self.breakout_strategy else {}
+                mean_reversion_signal = self.mean_reversion_strategy.generate_signals(prev_data) if self.mean_reversion_strategy else {}
+
                 # 戦略の統合
                 signal_info = self.strategy_integrator.integrate_strategies(
-                    {}, breakout_signal, mean_reversion_signal, prev_data
+                    trend_signal, breakout_signal, mean_reversion_signal, prev_data
                 )
                 
                 current_price = current_data['close']
