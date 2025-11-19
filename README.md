@@ -187,6 +187,29 @@ python multi_pair_runner.py
 - 戦略別パフォーマンス分析（TXT）
 - ウォークフォワード分析結果（JSON）
 
+## パラメータ最適化
+
+戦略のパフォーマンスを最大化するために、以下の2つの方法でパラメータを最適化できます。
+
+### 1. ベイズ最適化 (Optuna)
+広範囲のパラメータ空間を効率的に探索します。推奨される方法です。
+
+```bash
+# 50回の試行で最適化を実行
+python optuna_search.py --trials 50
+
+# スタディ名を指定して実行
+python optuna_search.py --trials 100 --study-name "optimization_2024"
+```
+
+### 2. グリッドサーチ
+指定したパラメータの組み合わせを全探索します。組み合わせ数が多いと時間がかかります。
+
+```bash
+# グリッドサーチを実行
+python parameter_search.py --output results/grid_search
+```
+
 ## Dockerコマンド例
 
 特定の期間でバックテストを実行：
