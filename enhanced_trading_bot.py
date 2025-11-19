@@ -23,8 +23,13 @@ import traceback
 from typing import Dict, List, Tuple, Optional, Union, Any
 from config_validator import ConfigValidator, ConfigValidationError
 from risk_manager import RiskManager
+from strategy_integrator import StrategyIntegrator
+from strategies.mean_reversion import MeanReversionStrategy
+from strategies.trend import TrendStrategy
+from strategies.breakout import BreakoutStrategy
 import warnings
 import pickle
+import joblib # 追加
 
 # 環境変数の読み込み
 load_dotenv()
@@ -46,12 +51,12 @@ class EnhancedTradingBot:
         # API設定
         self.api_key = os.getenv("BINANCE_API_KEY")
         self.api_secret = os.getenv("BINANCE_API_SECRET")
-        self.client = None  # バックテスト時は初期化せず、ライブトレード時のみ初期化
         
         # 取引設定
         self.symbol = os.getenv("SYMBOL", "BTCUSDT")
         self.interval = os.getenv("INTERVAL", "1h")
-        self.trade_quantity = float(os.getenv("QUANTITY", "0.001"))
+        self.quantity = float(os.getenv("QUANTITY", "0.001"))
+        self.trade_quantity = self.quantity
         
         # 基本的な戦略パラメータ
         self.short_window = int(os.getenv("SHORT_WINDOW", "3"))
@@ -95,6 +100,55 @@ class EnhancedTradingBot:
         self.in_position = False
         self.entry_price = 0
         self.stop_loss = 0
+        self.take_profit = 0
+        self.entry_time = None
+        self.trade_quantity = self.quantity # 初期値
+        
+        # MLフィルター設定
+        self.enable_ml_filter = os.getenv("ENABLE_ML_FILTER", "false").lower() == "true"
+        self.ml_prob_threshold = float(os.getenv("ML_PROB_THRESHOLD", "0.5"))
+        self.ml_model = None
+        self.ml_features = None
+        
+        if self.enable_ml_filter:
+            try:
+                self.ml_model = joblib.load("models/lgbm_model_latest.pkl")
+                self.ml_features = joblib.load("models/features_latest.pkl")
+                logger.info("MLモデルをロードしました")
+            except FileNotFoundError:
+                logger.warning("MLモデルが見つかりません。MLフィルターは無効化されます。")
+                self.enable_ml_filter = False
+            except Exception as e:
+                logger.error(f"MLモデルのロード中にエラーが発生しました: {e}")
+                self.enable_ml_filter = False
+
+        # クライアント初期化
+        if self.api_key and self.api_secret:
+            try:
+                self.client = Client(self.api_key, self.api_secret)
+                logger.info("Binance Client initialized")
+            except Exception as e:
+                logger.warning(f"Binance Client initialization failed: {e}")
+                self.client = None
+        else:
+            self.client = None
+            logger.warning("APIキーが設定されていません。バックテストモードでのみ動作します。")
+            
+        # 戦略統合クラスの初期化
+        self.strategy_integrator = StrategyIntegrator()
+        
+        # リスク管理クラスの初期化
+        self.risk_manager = RiskManager()
+        
+        # 設定の検証
+        self._validate_configuration()
+        
+        # 戦略の初期化（ログ出力前に必要）
+        self._import_strategies()
+        self._initialize_strategies()
+        
+        # 設定のログ出力
+        self._log_configuration()
         self.take_profit = 0
         self.current_trade = {}
         
@@ -229,8 +283,8 @@ class EnhancedTradingBot:
         # トレンド戦略の設定
         if self.enable_trend:
             trend_config = {
-                'short_window': self.short_window,
-                'long_window': self.long_window,
+                'short_window': int(os.getenv("TREND_SHORT_WINDOW", self.short_window)),
+                'long_window': int(os.getenv("TREND_LONG_WINDOW", self.long_window)),
                 'adx_threshold': float(os.getenv("TREND_ADX_THRESHOLD", "25")),
             }
             self.enabled_strategies.append('trend')
@@ -573,6 +627,56 @@ class EnhancedTradingBot:
 
         # ATR比率（ボラティリティの相対指標）
         df['atr_ratio'] = df['ATR'] / df['close']
+        
+        # CCI (Commodity Channel Index)
+        tp = (df['high'] + df['low'] + df['close']) / 3
+        sma_tp = tp.rolling(window=20).mean()
+        mean_dev = tp.rolling(window=20).apply(lambda x: np.mean(np.abs(x - x.mean())))
+        df['CCI'] = (tp - sma_tp) / (0.015 * mean_dev)
+        
+        # MFI (Money Flow Index)
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        raw_money_flow = typical_price * df['volume']
+        
+        positive_flow = pd.Series(0.0, index=df.index)
+        negative_flow = pd.Series(0.0, index=df.index)
+        
+        # 前日比プラスならPositive Flow, マイナスならNegative Flow
+        price_change = typical_price.diff()
+        positive_flow[price_change > 0] = raw_money_flow[price_change > 0]
+        negative_flow[price_change < 0] = raw_money_flow[price_change < 0]
+        
+        mfi_period = 14
+        positive_mf = positive_flow.rolling(window=mfi_period).sum()
+        negative_mf = negative_flow.rolling(window=mfi_period).sum()
+        
+        mfi_ratio = positive_mf / negative_mf
+        df['MFI'] = 100 - (100 / (1 + mfi_ratio))
+        
+        # Williams %R
+        wr_period = 14
+        highest_high = df['high'].rolling(window=wr_period).max()
+        lowest_low = df['low'].rolling(window=wr_period).min()
+        df['williams_r'] = (highest_high - df['close']) / (highest_high - lowest_low) * -100
+        
+        # Stochastic Oscillator
+        stoch_period = 14
+        stoch_k_smooth = 3
+        stoch_d_smooth = 3
+        
+        # %K = (Current Close - Lowest Low) / (Highest High - Lowest Low) * 100
+        # ここでは上記のhighest_high, lowest_lowを再利用可能だが、期間が違う可能性もあるので念のため再計算
+        # (同じ14期間なら再利用可)
+        df['stoch_k_raw'] = (df['close'] - lowest_low) / (highest_high - lowest_low) * 100
+        df['stoch_k'] = df['stoch_k_raw'].rolling(window=stoch_k_smooth).mean()
+        df['stoch_d'] = df['stoch_k'].rolling(window=stoch_d_smooth).mean()
+        
+        # ML用追加特徴量
+        # 移動平均乖離率
+        df['ma_divergence'] = (df['close'] - df['EMA_short']) / df['EMA_short']
+        
+        # 変化率 (Rate of Change)
+        df['roc'] = df['close'].pct_change(periods=1)
 
         return df
     
@@ -822,9 +926,24 @@ class EnhancedTradingBot:
         # ADXとatr_ratioをsignal_infoに追加
         signal_info_with_market = signal_info.copy()
         signal_info_with_market['adx'] = current_data.get('ADX', 0)
-        signal_info_with_market['atr_ratio'] = current_data.get('atr_ratio', 0)
-
+        
+        # ATR比率の計算と設定
+        if 'ATR' in current_data and current_price > 0:
+             signal_info_with_market['atr_ratio'] = current_data['ATR'] / current_price
+        else:
+             signal_info_with_market['atr_ratio'] = 0
+             
         prev_data = pd.DataFrame([current_data])
+        
+        # ATR変化率（ボラティリティの勢い）
+        if 'ATR' in current_data and 'ATR' in prev_data.iloc[-1]:
+            prev_atr = prev_data.iloc[-1]['ATR']
+            if prev_atr > 0:
+                signal_info_with_market['atr_change'] = (current_data['ATR'] - prev_atr) / prev_atr
+            else:
+                signal_info_with_market['atr_change'] = 0
+        else:
+            signal_info_with_market['atr_change'] = 0
         should_skip, skip_reason = self.risk_manager.should_skip_trade(signal_info_with_market, prev_data)
         if should_skip:
             logger.debug(f"エントリースキップ: {skip_reason}")
@@ -837,6 +956,40 @@ class EnhancedTradingBot:
             logger.debug(f"高度フィルターによるスキップ: {adv_reason}")
             return None
 
+        # 5.5 MLフィルター
+        if self.enable_ml_filter and self.ml_model is not None:
+            try:
+                # 特徴量の抽出
+                # current_dataはSeriesなので、DataFrameに変換
+                feature_data = pd.DataFrame([current_data])
+                
+                # モデルが必要とする特徴量のみを選択
+                # 欠損値がある場合はfillna(0)で埋める
+                # 注意: ml_featuresに含まれるカラムがcurrent_dataに存在しない場合エラーになるため、
+                # 存在しないカラムは0で埋めるなどの処理が必要だが、
+                # 基本的にcalculate_indicatorsで計算されているはず
+                
+                # 必要なカラムが揃っているか確認し、不足があれば追加
+                for col in self.ml_features:
+                    if col not in feature_data.columns:
+                        feature_data[col] = 0
+                
+                X_pred = feature_data[self.ml_features].fillna(0)
+                
+                # 予測 (クラス1の確率)
+                prob = self.ml_model.predict_proba(X_pred)[0][1]
+                
+                if prob < self.ml_prob_threshold:
+                    logger.debug(f"MLフィルターによるスキップ: 予測確率 {prob:.4f} < {self.ml_prob_threshold}")
+                    return None
+                else:
+                    logger.debug(f"MLフィルター通過: 予測確率 {prob:.4f}")
+                    
+            except Exception as e:
+                logger.error(f"ML予測エラー: {e}")
+                # エラー時は安全のためスキップせず、ログだけ出して続行
+                pass
+
         # 6. エントリー品質チェック
         entry_timing = self.risk_manager.calculate_optimal_entry_timing(signal_info_with_market, prev_data)
         if entry_timing['entry_quality'] == 'poor':
@@ -846,16 +999,11 @@ class EnhancedTradingBot:
                 logger.debug(f"エントリー品質不良: {entry_timing['score']}/5")
                 return None
 
-        # ATRベースの動的ポジションサイジング
-        atr_value = current_data.get('ATR', None)
-        if atr_value and atr_value > 0:
-            self.trade_quantity = self.risk_manager.calculate_position_size(balance, atr_value, current_price)
-            # 連続損失による追加縮小
-            self.trade_quantity *= size_factor
-        else:
-            # ATRが無い場合はデフォルト値を使用
-            risk_amount = balance * self.risk_per_trade
-            self.trade_quantity = risk_amount / (current_price * 0.01) * size_factor
+        # ポジションサイズ計算（固定数量ベース）
+        self.trade_quantity = self.quantity
+        
+        # 連続損失による縮小
+        self.trade_quantity *= size_factor
 
         # 実行価格をシミュレート
         execution_price = float(next_candle['open'])

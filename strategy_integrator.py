@@ -95,9 +95,34 @@ class StrategyIntegrator:
             is_trending, is_high_volatility, is_low_volatility, 
             signals, signal_strengths
         )
-        # 高ボラティリティ時は平均回帰の重みを下げる
-        if is_high_volatility:
-            weights['mean_reversion'] *= 0.5
+        
+        # ボラティリティの急激な拡大（VVIX的挙動）をチェック
+        atr_change = 0
+        if len(data) >= 2 and 'ATR' in data.columns:
+            prev_atr = data['ATR'].iloc[-2]
+            if prev_atr > 0:
+                atr_change = (atr - prev_atr) / prev_atr
+        
+        # ボラティリティフィルタリングロジック (無効化: パフォーマンス低下のため)
+        # if is_high_volatility:
+        #     # 高ボラティリティ時は平均回帰のリスクが高まるため重みを下げる
+        #     weights['mean_reversion'] *= 0.7
+        #     
+        #     # 極端な高ボラティリティ（パニック相場）の場合は全戦略を抑制
+        #     if atr_ratio > self.config['high_vol_threshold'] * 1.5:
+        #         for s in weights:
+        #             weights[s] *= 0.7
+        #             
+        # elif is_low_volatility:
+        #     # 低ボラティリティ時はトレンド戦略が機能しにくい
+        #     weights['trend'] *= 0.5
+        #     weights['breakout'] *= 0.5
+            
+        # ボラティリティが急拡大している場合（クラッシュや急騰の初動）
+        # if atr_change > 0.3:
+        #      # ブレイクアウトを重視し、逆張り（平均回帰）を抑制
+        #      weights['breakout'] *= 1.2
+        #      weights['mean_reversion'] *= 0.5
         
         # 加重平均でシグナルを統合
         weighted_signal = 0
@@ -188,41 +213,47 @@ class StrategyIntegrator:
             'mean_reversion': 0.0
         }
         
-        # トレンド環境での重み付け - mean_reversion の重みを増加
+        # トレンド環境での重み付け - トレンド戦略を重視
         if is_trending:
             if is_high_volatility:
-                # 高ボラティリティなトレンド
-                weights['trend'] = 0.45
-                weights['breakout'] = 0.35
-                weights['mean_reversion'] = 0.20  # 0.1から0.2に増加
+                # 高ボラティリティなトレンド: ブレイクアウトが有効
+                weights['trend'] = 0.40
+                weights['breakout'] = 0.40
+                weights['mean_reversion'] = 0.20
             else:
-                # 通常のトレンド
+                # 通常のトレンド: トレンドフォローが有効
                 weights['trend'] = 0.50
                 weights['breakout'] = 0.30
-                weights['mean_reversion'] = 0.20  # 0.1から0.2に増加
+                weights['mean_reversion'] = 0.20
         
-        # レンジ環境での重み付け - mean_reversion の重みをさらに増加
+        # レンジ環境での重み付け - 平均回帰を重視
         else:
             if is_low_volatility:
-                # 低ボラティリティなレンジ
-                weights['trend'] = 0.05  # 0.1から減少
-                weights['breakout'] = 0.15  # 0.2から減少
-                weights['mean_reversion'] = 0.80  # 0.7から増加
+                # 低ボラティリティなレンジ: 平均回帰が非常に有効
+                weights['trend'] = 0.10
+                weights['breakout'] = 0.10
+                weights['mean_reversion'] = 0.80
             else:
-                # 通常のレンジ
-                weights['trend'] = 0.15  # 0.2から減少
-                weights['breakout'] = 0.25  # 0.3から減少
-                weights['mean_reversion'] = 0.60  # 0.5から増加
+                # 通常のレンジ: 平均回帰が有効
+                weights['trend'] = 0.20
+                weights['breakout'] = 0.20
+                weights['mean_reversion'] = 0.60
         
-        # 平均回帰シグナルが特に強い場合、その重みをさらに増加
+        # 平均回帰シグナルが特に強い場合、その重みをさらに増加（カウンター狙い）
         if abs(signals['mean_reversion']) > 0 and signal_strengths['mean_reversion'] > self.config['strong_signal_threshold']:
             # 他の戦略の重みを減らし、平均回帰の重みを増加
             for strategy in ['trend', 'breakout']:
-                weights[strategy] *= 0.8  # 20%減少
+                weights[strategy] *= 0.7  # 30%減少
             
             # 減少分を平均回帰の重みに加算
-            weight_reduction = (weights['trend'] * 0.2 + weights['breakout'] * 0.2)
+            weight_reduction = (weights['trend'] * 0.3 + weights['breakout'] * 0.3)
             weights['mean_reversion'] += weight_reduction
+            
+        # トレンドシグナルが特に強い場合（トレンド相場での押し目など）
+        if abs(signals['trend']) > 0 and signal_strengths['trend'] > self.config['strong_signal_threshold']:
+             if is_trending:
+                weights['trend'] = max(weights['trend'], 0.6)
+                weights['mean_reversion'] = min(weights['mean_reversion'], 0.2)
         
         return weights
     

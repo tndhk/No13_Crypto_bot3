@@ -228,8 +228,18 @@ class MultiPairRunner:
 
 def main():
     """メイン関数"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Multi-Pair Backtest Runner")
+    parser.add_argument("--symbols", type=str, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
+    args = parser.parse_args()
+    
+    symbols = None
+    if args.symbols:
+        symbols = [s.strip() for s in args.symbols.split(",")]
+        
     # 環境変数からシンボルリストを読み込んで実行
-    runner = MultiPairRunner()
+    runner = MultiPairRunner(symbols=symbols)
     runner.run_all()
     runner.print_summary()
     runner.save_results()

@@ -112,7 +112,7 @@ class RiskManager:
         tuple
             (取引可能かどうか, ポジションサイズ調整率)
         """
-        if self.consecutive_losses >= self.config['max_consecutive_losses']:
+        if self.config['max_consecutive_losses'] > 0 and self.consecutive_losses >= self.config['max_consecutive_losses']:
             return False, 0
 
         # 連続損失に応じてポジションサイズを縮小
@@ -128,39 +128,53 @@ class RiskManager:
             self.consecutive_losses = 0
         else:
             self.consecutive_losses += 1
-            if self.consecutive_losses >= self.config['max_consecutive_losses']:
+            if self.config['max_consecutive_losses'] > 0 and self.consecutive_losses >= self.config['max_consecutive_losses']:
                 logger.warning(f"連続損失が{self.consecutive_losses}回に達しました。取引を一時停止します。")
 
-    def calculate_position_size(self, balance: float, atr: float, price: float) -> float:
+    def calculate_position_size(self, balance: float, atr: float, current_price: float) -> float:
         """
-        ATRに基づく動的ポジションサイジング
-
+        ATRベースのポジションサイジング
+        
         Parameters:
         -----------
-        balance : float
-            現在残高
         atr : float
-            Average True Range
-        price : float
+            ATR値
+        current_price : float
             現在価格
-
+            
         Returns:
         --------
         float
-            推奨ポジションサイズ
+            計算されたポジションサイズ（数量）
         """
-        # 基本リスク額（資本の1%）
-        risk_amount = balance * 0.01
-
-        # ATRベースのポジションサイズ
-        if atr > 0:
-            position_size = risk_amount / atr
-        else:
-            position_size = risk_amount / (price * 0.01)
-
-        # 最大ポジションサイズ制限
-        max_position = (balance * self.config['max_position_size_percent'] / 100) / price
-        position_size = min(position_size, max_position)
+        if atr <= 0 or current_price <= 0:
+            return self.config.get('base_quantity', 0.025)
+            
+        # 1トレードあたりの許容リスク額（残高のN%）
+        # configにない場合はデフォルト2.0% (調整: 1.0 -> 2.0)
+        risk_percent = self.config.get('risk_per_trade_percent', 2.0)
+        risk_per_trade = balance * (risk_percent / 100.0)
+        
+        # ストップロス幅（ATRの倍数）
+        # 実際のSLが0.5%とタイトなため、計算上の幅も狭めてサイズを確保する
+        stop_loss_distance = atr * 1.0 # 調整: 2.0 -> 1.0
+        
+        # ポジションサイズ計算: リスク額 / ストップ幅
+        # Risk = Size * StopDistance  =>  Size = Risk / StopDistance
+        position_size = risk_per_trade / stop_loss_distance
+        
+        # 最小・最大サイズの制限
+        min_size = 0.001 # BTCの最小単位（例）
+        max_size = (balance * 0.95) / current_price # 全力買いの95%まで
+        
+        # configの最大ポジションサイズ制限も考慮
+        if 'max_position_size_percent' in self.config:
+            max_allowed = (balance * self.config['max_position_size_percent'] / 100.0) / current_price
+            max_size = min(max_size, max_allowed)
+        
+        position_size = max(min_size, min(position_size, max_size))
+        
+        return position_size
 
         # 連続損失による縮小
         can_trade, size_factor = self.check_consecutive_losses()
@@ -447,6 +461,56 @@ class RiskManager:
                 market_phase = 'neutral'
         else:
             market_phase = 'neutral'
+            
+        return {
+            'trend_direction': trend_direction,
+            'volatility_regime': volatility_regime,
+            'momentum': momentum,
+            'market_phase': market_phase
+        }
+
+    def should_skip_trade(self, signal_info: Dict, prev_data: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        リスク要因に基づいて取引をスキップすべきか判定
+        
+        Parameters:
+        -----------
+        signal_info : dict
+            シグナル情報（atr_ratio, atr_changeなどを含む）
+        prev_data : pd.DataFrame
+            過去データ
+            
+        Returns:
+        --------
+        tuple
+            (スキップすべきか, 理由)
+        """
+        # ボラティリティフィルターはパフォーマンス低下のため無効化
+        return False, ""
+        
+        # 1. 極端なボラティリティ拡大（フラッシュクラッシュ/急騰）
+        # atr_change = signal_info.get('atr_change', 0)
+        # if atr_change > 0.5: # ATRが50%以上急拡大 (緩和: 30% -> 50%)
+        #     return True, f"ボラティリティ急拡大(ATR変化率: {atr_change:.2%})"
+            
+        # 2. 極端な高ボラティリティ
+        # atr_ratio = signal_info.get('atr_ratio', 0)
+        # if atr_ratio > 0.06: # 価格の6%以上の変動幅 (緩和: 4% -> 6%)
+        #     return True, f"極端な高ボラティリティ(ATR比率: {atr_ratio:.2%})"
+            
+        # 3. 極端な低ボラティリティ（動きがない）
+        # if atr_ratio < 0.001: # 価格の0.1%未満の変動幅 (緩和: 0.2% -> 0.1%)
+        #     return True, f"極端な低ボラティリティ(ATR比率: {atr_ratio:.2%})"
+            
+        # return False, ""
+
+    def advanced_market_filter(self, signal_info: Dict, prev_data: pd.DataFrame) -> Tuple[bool, str]:
+        """高度な市場フィルター（将来的な拡張用）"""
+        return False, ""
+
+    def calculate_optimal_entry_timing(self, signal_info: Dict, prev_data: pd.DataFrame) -> Dict:
+        """エントリータイミングの最適化（簡易版）"""
+        return {'entry_quality': 'good', 'score': 5}
 
         # 5. ADXによるトレンド強度
         adx = current.get('ADX', 0)

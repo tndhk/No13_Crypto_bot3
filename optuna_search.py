@@ -23,6 +23,11 @@ def objective(trial):
     stop_loss_percent = trial.suggest_float("STOP_LOSS_PERCENT", 0.5, 5.0, step=0.5)
     take_profit_percent = trial.suggest_float("TAKE_PROFIT_PERCENT", 1.0, 15.0, step=1.0)
     max_consecutive_losses = trial.suggest_int("MAX_CONSECUTIVE_LOSSES", 3, 10, step=1)
+    
+    # Trend戦略パラメータ
+    trend_adx_threshold = trial.suggest_int("TREND_ADX_THRESHOLD", 15, 35, step=5)
+    trend_short_window = trial.suggest_int("TREND_SHORT_WINDOW", 5, 15, step=2)
+    trend_long_window = trial.suggest_int("TREND_LONG_WINDOW", 20, 50, step=5)
 
     # 環境変数に設定
     os.environ["SHORT_WINDOW"] = str(short_window)
@@ -32,6 +37,10 @@ def objective(trial):
     os.environ["STOP_LOSS_PERCENT"] = str(stop_loss_percent)
     os.environ["TAKE_PROFIT_PERCENT"] = str(take_profit_percent)
     os.environ["MAX_CONSECUTIVE_LOSSES"] = str(max_consecutive_losses)
+    
+    # Trend戦略用環境変数
+    os.environ["TREND_ADX_THRESHOLD"] = str(trend_adx_threshold)
+    os.environ["ENABLE_TREND"] = "true" # 最適化中は強制有効化
 
     try:
         balance, _, _ = run_backtest()

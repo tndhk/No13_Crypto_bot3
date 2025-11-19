@@ -59,36 +59,90 @@ class TrendStrategy:
         
         # 基本シグナル
         signal = 0
-        signal_strength = 0 # 単純化のため、強度は 1 or 0 とする
+        signal_strength = 0
         signal_reasons = []
         
+        # ADXによるトレンド強度の確認
+        adx_value = current.get('ADX', self._calculate_adx(data))
+        is_trending = adx_value > self.config['adx_threshold']
+        
+        # トレンドがない場合はシグナルを出さない
+        if not is_trending:
+            return {
+                'timestamp': current['timestamp'],
+                'open': current['open'],
+                'high': current['high'],
+                'low': current['low'],
+                'close': current['close'],
+                'signal': 0,
+                'adx': adx_value,
+                'signal_strength': 0,
+                'signal_reasons': [f"トレンドなし(ADX={adx_value:.1f})"]
+            }
+            
         # 1. 移動平均クロスオーバー検出
+        ma_signal = 0
         if 'EMA_short' in current and 'EMA_long' in current:
             # 短期MAが長期MAを上抜け（買い）
             if (previous['EMA_short'] <= previous['EMA_long'] and 
                 current['EMA_short'] > current['EMA_long']):
-                signal = 1
+                ma_signal = 1
                 signal_reasons.append(f"EMAクロス(上抜け)")
             
             # 短期MAが長期MAを下抜け（売り）
             elif (previous['EMA_short'] >= previous['EMA_long'] and 
                   current['EMA_short'] < current['EMA_long']):
-                signal = -1
+                ma_signal = -1
                 signal_reasons.append(f"EMAクロス(下抜け)")
-
-        # 2. ADXによるトレンド強度の確認 (フィルターとしてのみ使用)
-        if signal != 0: # クロスオーバーが発生した場合のみADXをチェック
-            adx_value = current.get('ADX', self._calculate_adx(data))
             
-            # ADXが閾値未満ならシグナルを無効化
-            if adx_value < self.config['adx_threshold']:
-                signal = 0 # トレンドがないのでシグナルをキャンセル
-                signal_reasons.append(f"ADX閾値未満({adx_value:.1f} < {self.config['adx_threshold']}) - シグナル取消")
-            else:
-                # トレンドありと判断、シグナル強度をセット
-                signal_strength = 1.0 
-                signal_reasons.append(f"ADXトレンド確認({adx_value:.1f} >= {self.config['adx_threshold']})")
+            # 既存のトレンド継続確認
+            elif current['EMA_short'] > current['EMA_long']:
+                ma_signal = 0.5 # 上昇トレンド継続
+            elif current['EMA_short'] < current['EMA_long']:
+                ma_signal = -0.5 # 下降トレンド継続
+
+        # 2. MACD確認
+        macd_signal = 0
+        if 'MACD' in current and 'MACD_signal' in current:
+            if current['MACD'] > current['MACD_signal']:
+                macd_signal = 1
+            elif current['MACD'] < current['MACD_signal']:
+                macd_signal = -1
         
+        # 3. シグナル統合
+        # クロスオーバーが発生し、かつMACDが同方向の場合に強いシグナル
+        if abs(ma_signal) == 1:
+            if ma_signal * macd_signal > 0:
+                signal = ma_signal
+                signal_strength = 0.8
+                signal_reasons.append("MACD確認")
+                
+                # ADXが非常に強い場合はさらに強化
+                if adx_value > self.config['adx_strong_threshold']:
+                    signal_strength = 1.0
+                    signal_reasons.append(f"強いトレンド(ADX={adx_value:.1f})")
+            else:
+                # MACDと不一致の場合は弱める
+                signal = ma_signal
+                signal_strength = 0.4
+                signal_reasons.append("MACD不一致")
+        
+        # トレンド継続中の押し目買い/戻り売り（RSI使用）
+        elif abs(ma_signal) == 0.5:
+            rsi = current.get('RSI', 50)
+            
+            # 上昇トレンド中の押し目（RSI低下）
+            if ma_signal > 0 and rsi < 45 and rsi > 30:
+                signal = 1
+                signal_strength = 0.6
+                signal_reasons.append(f"押し目買い(RSI={rsi:.1f})")
+            
+            # 下降トレンド中の戻り（RSI上昇）
+            elif ma_signal < 0 and rsi > 55 and rsi < 70:
+                signal = -1
+                signal_strength = 0.6
+                signal_reasons.append(f"戻り売り(RSI={rsi:.1f})")
+
         # シグナル情報をまとめる
         signal_info = {
             'timestamp': current['timestamp'],
@@ -97,13 +151,13 @@ class TrendStrategy:
             'low': current['low'],
             'close': current['close'],
             'signal': signal,
-            'adx': current.get('ADX', np.nan), # adx_value を使うか、元の値を使うか注意
-            'signal_strength': signal_strength, # 1.0 or 0.0
+            'adx': adx_value,
+            'signal_strength': signal_strength,
             'signal_reasons': signal_reasons
         }
         
-        # 既存の指標情報も追加 (必要最低限)
-        for key in ['EMA_short', 'EMA_long', 'ADX']: # RSI, MACD, SMA, ATR は不要に
+        # 既存の指標情報も追加
+        for key in ['EMA_short', 'EMA_long', 'ADX', 'MACD', 'RSI']:
             if key in current:
                 signal_info[key] = current[key]
         
